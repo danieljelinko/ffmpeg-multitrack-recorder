@@ -4,6 +4,7 @@ Structured for autonomous agent execution. Follow phases in order; each item has
 
 ## Phase A: Enable JVB Colibri2 forwarders
 - [ ] Expose Colibri2 REST/WS in compose for `jvb` (internal only); document ports/env.
+- [ ] Verify JVB version supports forwarders; if missing, bump image or enable feature flags.
 - [ ] Verify from controller container: `curl $JVB_COLIBRI2_URL/about` returns info.
 - [ ] Acceptance: Colibri2 reachable from inside `meet.jitsi`; no public exposure.
 
@@ -17,15 +18,15 @@ Structured for autonomous agent execution. Follow phases in order; each item has
 - **Test:** `test_api_auth()` - success with correct secret, fail without/wrong.
 
 ## Phase C: Colibri2 client + discovery
-- [ ] Implement helper to resolve conference endpoints (Roster) via Prosody/Jicofo or passed participant list.
-- [ ] Implement Colibri2 client: allocate/release RTP forwarders for audio per endpoint; capture IP/port/PT/ssrc.
+- [ ] Implement helper to resolve conference endpoints (Roster) via Prosody/Jicofo; support user-provided participant list as fallback.
+- [ ] Implement Colibri2 client: allocate/release RTP forwarders for audio per endpoint; capture IP/port/PT/ssrc; listen for SSRC refresh events.
 - [ ] Acceptance: For a live room, API returns mapping endpoint→RTP ports in response/logs.
 - **Test:** `test_forwarder_allocation()` - creates and releases forwarders; asserts non-empty ports.
 
 ## Phase D: FFmpeg launcher (audio multitrack)
 - [ ] Build FFmpeg command generator given forwarder map:
-  - [ ] One input per participant (`rtp://...` with RTCP, `-protocol_whitelist rtp,udp,file,crypto`).
-  - [ ] Output per participant: `.opus` with `-c:a copy` (or AAC `.m4a` if configured).
+  - [ ] One input per participant (`rtp://...` with RTCP, `-protocol_whitelist rtp,udp,file,crypto`, `-use_wallclock_as_timestamps 1`, `-fflags +igndts+genpts`).
+  - [ ] Output per participant: `.opus` with `-c:a copy` (or AAC `.m4a` if configured, with `aresample=async=1` to avoid drift).
   - [ ] Optional mixed track via `amix`.
 - [ ] Implement process supervisor: spawn FFmpeg, monitor exit, handle stop signal.
 - [ ] Acceptance: Starting a session produces N audio files for N inputs; files have audio energy.
@@ -38,15 +39,15 @@ Structured for autonomous agent execution. Follow phases in order; each item has
 - **Test:** `test_manifest_integrity()` - compute checksums and compare to manifest entries.
 
 ## Phase F: Lifecycle & resilience
-- [ ] Handle participant join/leave: refresh forwarders/manifest or restart FFmpeg safely.
+- [ ] Handle participant join/leave and SSRC churn: refresh forwarders/manifest or restart FFmpeg safely.
 - [ ] Handle failures: on FFmpeg crash, clean up forwarders and mark status `failed`.
-- [ ] Acceptance: Stop endpoint stops recording cleanly; forwarders released; status reflects outcome.
-- **Test:** `test_stop_and_cleanup()` - start recording, stop via API, ensure no forwarders remain.
+- [ ] Acceptance: Stop endpoint stops recording cleanly; forwarders released; status reflects outcome; SSRC changes do not orphan jobs.
+- **Test:** `test_stop_and_cleanup()` - start recording, stop via API, ensure no forwarders remain; simulate SSRC change and recover.
 
 ## Phase G: Compose integration
 - [ ] Add `controller` and `ffmpeg-recorder` services to compose, join `meet.jitsi`, mount recordings volume.
-- [ ] Wire env defaults: secrets, JVB URLs, recording path.
-- [ ] Acceptance: `docker compose up` brings new services healthy; API reachable internally.
+- [ ] Wire env defaults: secrets, JVB URLs, recording path; ensure controller binds internally (meet.jitsi/localhost only) unless explicitly published.
+- [ ] Acceptance: `docker compose up` brings new services healthy; API reachable internally; controller and Colibri2 not exposed publicly by default.
 - **Test:** `test_compose_health()` - `docker compose ps` reports healthy controller; `/health` 200.
 
 ## Phase H: End-to-end validation
