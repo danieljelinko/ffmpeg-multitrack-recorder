@@ -1,9 +1,9 @@
 import asyncio
 import os
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, Any, Optional, Callable
 
 from slixmpp import ClientXMPP
-from slixmpp.xmlstream import ET, register_stanza_plugin
+from slixmpp.xmlstream import ET
 
 
 class Colibri2IQ:
@@ -53,7 +53,6 @@ class XMPPBot(ClientXMPP):
         iq = Colibri2IQ.build_allocate(conference_id, endpoint_id)
         iq.attrib["to"] = self.bridge_jid
         result = await self._send_iq_async(iq)
-        # Placeholder parse: adapt to real response
         return {"id": endpoint_id, "bridge_jid": self.bridge_jid, "payload": result}
 
     async def _send_iq_async(self, iq_elem: ET.Element) -> ET.Element:
@@ -71,4 +70,7 @@ def create_xmpp_bot_from_env(logger: Optional[Callable[[str], None]] = None) -> 
     bridge_muc = os.environ.get("JVB_BRIDGE_MUC", "jvbbrewery@internal-muc.meet.jitsi")
     if not jid or not password:
         raise ValueError("XMPP_JID and XMPP_PASSWORD (or XMPP_COMPONENT_SECRET) are required")
-    return XMPPBot(jid=jid, password=password, bridge_muc=bridge_muc, logger=logger)
+    bot = XMPPBot(jid=jid, password=password, bridge_muc=bridge_muc, logger=logger)
+    bot.register_plugin("xep_0030")  # Service Discovery
+    bot.register_plugin("xep_0045")  # MUC for brewery discovery
+    return bot
