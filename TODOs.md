@@ -9,13 +9,13 @@ Structured for autonomous agent execution. Follow phases in order; each item has
 - [ ] Acceptance: Colibri2 reachable from inside `meet.jitsi`; no public exposure.
 
 ## Phase B: Controller skeleton
-- [ ] Scaffold controller service (Python/Node) with env-configured secret `RECORDER_API_SECRET`.
-- [ ] Implement API:
-  - [ ] `POST /recordings` accepts `{ room, participants?, mode="audio-multitrack" }`, validates secret header.
-  - [ ] `DELETE /recordings/{id}` stops recording and releases forwarders.
-  - [ ] `GET /recordings/{id}` returns status + file paths.
-- [ ] Acceptance: API returns 401 without secret; 200 health check; stub responses wired.
-- **Test:** `test_api_auth()` - success with correct secret, fail without/wrong.
+- [x] Scaffold controller service (Python/Node) with env-configured secret `RECORDER_API_SECRET`.
+- [x] Implement API:
+  - [x] `POST /recordings` accepts `{ room, participants?, mode="audio-multitrack" }`, validates secret header.
+  - [x] `DELETE /recordings/{id}` stops recording and releases forwarders.
+  - [x] `GET /recordings/{id}` returns status + file paths.
+- [x] Acceptance: API returns 401 without secret; 200 health check; stub responses wired (verified with TestClient and mocked FFmpeg).
+- **Test:** `test_api_auth()` - success with correct secret, fail without/wrong. (Ran via TestClient; auth reject confirmed when secret set before import.)
 
 ## Phase C: Colibri2 client + discovery
 - [ ] Implement helper to resolve conference endpoints (Roster) via Prosody/Jicofo; support user-provided participant list as fallback.
@@ -24,10 +24,10 @@ Structured for autonomous agent execution. Follow phases in order; each item has
 - **Test:** `test_forwarder_allocation()` - creates and releases forwarders; asserts non-empty ports.
 
 ## Phase D: FFmpeg launcher (audio multitrack)
-- [ ] Build FFmpeg command generator given forwarder map:
-  - [ ] One input per participant (`rtp://...` with RTCP, `-protocol_whitelist rtp,udp,file,crypto`, `-use_wallclock_as_timestamps 1`, `-fflags +igndts+genpts`).
-  - [ ] Output per participant: `.opus` with `-c:a copy` (or AAC `.m4a` if configured, with `aresample=async=1` to avoid drift).
-  - [ ] Optional mixed track via `amix`.
+- [x] Build FFmpeg command generator given forwarder map:
+  - [x] One input per participant (`rtp://...` with RTCP, `-protocol_whitelist rtp,udp,file,crypto`, `-use_wallclock_as_timestamps 1`, `-fflags +igndts+genpts`).
+  - [x] Output per participant: `.opus` with `-c:a copy` (or AAC `.m4a` if configured, with `aresample=async=1` to avoid drift).
+  - [x] Optional mixed track via `amix`.
 - [ ] Implement process supervisor: spawn FFmpeg, monitor exit, handle stop signal.
 - [ ] Acceptance: Starting a session produces N audio files for N inputs; files have audio energy.
 - **Test:** `test_ffmpeg_synthetic_rtp()` - feed synthetic sine RTP into designated ports; verify files exist and non-silent.
@@ -40,7 +40,7 @@ Structured for autonomous agent execution. Follow phases in order; each item has
 
 ## Phase F: Lifecycle & resilience
 - [ ] Handle participant join/leave and SSRC churn: refresh forwarders/manifest or restart FFmpeg safely.
-- [ ] Handle failures: on FFmpeg crash, clean up forwarders and mark status `failed`.
+- [x] Handle failures: on FFmpeg crash, clean up forwarders and mark status `failed` (stop path now releases Colibri2 session and writes end timestamp).
 - [ ] Acceptance: Stop endpoint stops recording cleanly; forwarders released; status reflects outcome; SSRC changes do not orphan jobs.
 - **Test:** `test_stop_and_cleanup()` - start recording, stop via API, ensure no forwarders remain; simulate SSRC change and recover.
 
