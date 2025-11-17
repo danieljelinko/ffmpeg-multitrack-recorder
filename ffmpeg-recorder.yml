@@ -2,8 +2,10 @@ version: '3.5'
 
 services:
   controller:
-    # Placeholder image; build your own lightweight API service (Python/Node) that talks to JVB Colibri2.
-    image: ghcr.io/your-org/ffmpeg-recorder-controller:latest
+    build:
+      context: .
+      dockerfile: controller/Dockerfile
+    image: ffmpeg-multitrack-controller:local
     restart: ${RESTART_POLICY:-unless-stopped}
     environment:
       - RECORDER_API_SECRET
@@ -14,20 +16,10 @@ services:
     networks:
       meet.jitsi:
     volumes:
-      - ${CONFIG}/controller:/config:Z
       - ${RECORDINGS_PATH:-./recordings}:/recordings:Z
     ports:
       # Expose only if you need host access; otherwise rely on internal Docker network.
       - "127.0.0.1:${RECORDER_API_PORT:-8288}:8080"
-
-  ffmpeg-recorder:
-    image: jrottenberg/ffmpeg:6.1-ubuntu
-    restart: ${RESTART_POLICY:-unless-stopped}
-    entrypoint: ["/bin/sh", "-c", "tail -f /dev/null"]
-    networks:
-      meet.jitsi:
-    volumes:
-      - ${RECORDINGS_PATH:-./recordings}:/recordings:Z
 
 networks:
   meet.jitsi:

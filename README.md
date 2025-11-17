@@ -10,7 +10,8 @@ Server-side recording alternative to Jibri that captures individual participant 
 
 ## What’s in this repo snapshot
 - `docker-compose.yml` + `.env.example` — clean Jitsi stack (web, prosody, jicofo, jvb) mirroring the baseline from `jitsi-jibri-recording` but without Jibri.
-- `ffmpeg-recorder.yml` — overlay that introduces the controller + FFmpeg worker services (placeholders you’ll implement).
+- `ffmpeg-recorder.yml` — overlay that builds/starts the controller (FastAPI + FFmpeg) service.
+- `controller/` — Dockerfile + FastAPI app + FFmpeg launcher skeleton (no Selenium/Jibri).
 - `plan.md` — detailed architecture/design decisions, dependencies, risks, success criteria.
 - `TODOs.md` — execution checklists and acceptance criteria for each phase.
 - This README — quick overview and quick start for agents/operators.
@@ -24,15 +25,24 @@ Server-side recording alternative to Jibri that captures individual participant 
    (uses `docker-compose.yml` and `.env`).
 3) Enable Colibri2 on JVB (per `plan.md` / `TODOs.md`) and start the overlay:  
    ```bash
-   docker compose -f docker-compose.yml -f ffmpeg-recorder.yml up -d
+   docker compose -f docker-compose.yml -f ffmpeg-recorder.yml up -d --build
    ```
-4) Trigger recording via controller API (once implemented):  
+4) Trigger recording via controller API (current stub expects explicit RTP inputs unless you implement Colibri2 allocation):  
    ```bash
    curl -H "X-Auth-Token: $RECORDER_API_SECRET" \
      -X POST http://localhost:${RECORDER_API_PORT:-8288}/recordings \
-     -d '{"room":"myroom","mode":"audio-multitrack"}'
+     -H "Content-Type: application/json" \
+     -d '{
+           "room":"myroom",
+           "inputs":[
+             {"id":"speaker1","rtp_url":"rtp://127.0.0.1:5006"},
+             {"id":"speaker2","rtp_url":"rtp://127.0.0.1:5008"}
+           ],
+           "mix":true
+         }'
    ```
-5) Artifacts: `recordings/ffmpeg/<room>/<timestamp>/audio-<participant>.opus` (or `.m4a`) plus `manifest.json`.  
+   If you want automatic forwarder allocation, implement the Colibri2 client in `controller/colibri2.py` and supply `JVB_COLIBRI2_URL`.
+5) Artifacts: `recordings/ffmpeg/<room>/<timestamp>/audio-<participant>.opus` plus `manifest.json`; optional `mix.m4a` if `mix=true`.  
 6) Validate with synthetic RTP and a live meeting per the testing section.
 
 ## Why this over Jibri?
