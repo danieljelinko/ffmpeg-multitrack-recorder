@@ -1,0 +1,5 @@
+FROM jitsi/jicofo:unstable
+
+# Fix trusted-domains bug that causes XmppStringprepException
+# This bug causes "empty string" errors in XMPP authentication
+RUN sed -i 's/^      trusted-domains/      # trusted-domains/g' /defaults/jicofo.conf
