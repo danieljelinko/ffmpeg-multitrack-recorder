@@ -1,80 +1,62 @@
-# TODOs — FFmpeg Audio-Only Multitrack Recorder
+# TODOs — FFmpeg Audio-Only Multitrack Recorder (XMPP Colibri2)
 
-Structured for autonomous agent execution. Follow phases in order; each item has acceptance criteria and testing hooks. Reference `plan.md` for architecture details.
+Structured for autonomous agent execution. Phases follow the XMPP/Colibri2 (IQ) approach; REST `/colibri2` is not expected. Acceptance criteria included.
 
-## Phase A: Enable JVB Colibri2 forwarders
-- [ ] Expose Colibri2 REST/WS in compose for `jvb` (internal only); document ports/env.
-- [ ] Verify JVB version supports forwarders; if missing, bump image or enable feature flags.
-- [ ] Verify from controller container: `curl $JVB_COLIBRI2_URL/about` returns info.
-- [ ] Acceptance: Colibri2 reachable from inside `meet.jitsi`; no public exposure.
+## Phase A — XMPP plumbing & policy
+- [ ] Configure controller XMPP identity (component or client) and secrets: `XMPP_HOST`, `XMPP_PORT`, `XMPP_DOMAIN`, `XMPP_JID`/`XMPP_PASSWORD` or `XMPP_COMPONENT_SECRET`.
+- [ ] Disable P2P/E2EE for recorded rooms; document as precondition.
+- [ ] Acceptance: Controller can authenticate to Prosody and join the room MUC as a non-media occupant.
+- **Test:** `test_xmpp_auth()` — connect/auth, join MUC, see roster.
 
-## Phase B: Controller skeleton
-- [x] Scaffold controller service (Python/Node) with env-configured secret `RECORDER_API_SECRET`.
-- [x] Implement API:
-  - [x] `POST /recordings` accepts `{ room, participants?, mode="audio-multitrack" }`, validates secret header.
-  - [x] `DELETE /recordings/{id}` stops recording and releases forwarders.
-  - [x] `GET /recordings/{id}` returns status + file paths.
-- [x] Acceptance: API returns 401 without secret; 200 health check; stub responses wired (verified with TestClient and mocked FFmpeg).
-- **Test:** `test_api_auth()` - success with correct secret, fail without/wrong. (Ran via TestClient; auth reject confirmed when secret set before import.)
+## Phase B — Colibri2 IQ client (over XMPP)
+- [ ] Implement Colibri2 IQs to allocate/release audio forwarders per endpoint via bridge JID (discover from brewery MUC).
+- [ ] Subscribe to forwarder/SSRC updates; request receiver audio subscriptions if supported.
+- [ ] Acceptance: For a live room, API returns mapping endpoint→{ip,port,pt,ssrc}; releases succeed.
+- **Test:** `test_forwarder_allocation_xmpp()` — send allocate/release IQs, assert non-empty transport tuples.
 
-## Phase C: Colibri2 client + discovery
-- [ ] Implement helper to resolve conference endpoints (Roster) via Prosody/Jicofo; support user-provided participant list as fallback.
-- [ ] Implement Colibri2 client: allocate/release RTP forwarders for audio per endpoint; capture IP/port/PT/ssrc; listen for SSRC refresh events.
-- [ ] Acceptance: For a live room, API returns mapping endpoint→RTP ports in response/logs.
-- **Test:** `test_forwarder_allocation()` - creates and releases forwarders; asserts non-empty ports.
+## Phase C — FFmpeg via SDP (audio multitrack)
+- [ ] Generate SDP per forwarder tuple (Opus PT from Colibri2, include SSRC/rtcp-mux if present).
+- [ ] Launch FFmpeg per SDP: `-protocol_whitelist file,udp,rtp,crypto`, `-use_wallclock_as_timestamps 1`, `-fflags +igndts+genpts`, `-c:a copy` → `.mka`; optional `amix` mix track.
+- [ ] Supervisor captures logs, restarts affected inputs on SSRC change.
+- [ ] Acceptance: Starting a session produces N .mka files; optional mix when enabled.
+- **Test:** `test_ffmpeg_synthetic_sdp()` — feed synthetic RTP matching SDP, verify files non-silent.
 
-## Phase D: FFmpeg launcher (audio multitrack)
-- [x] Build FFmpeg command generator given forwarder map:
-  - [x] One input per participant (`rtp://...` with RTCP, `-protocol_whitelist rtp,udp,file,crypto`, `-use_wallclock_as_timestamps 1`, `-fflags +igndts+genpts`).
-  - [x] Output per participant: `.opus` with `-c:a copy` (or AAC `.m4a` if configured, with `aresample=async=1` to avoid drift).
-  - [x] Optional mixed track via `amix`.
-- [x] Implement process supervisor: spawn FFmpeg, monitor exit, handle stop signal (log pump + tail stored).
-- [ ] Acceptance: Starting a session produces N audio files for N inputs; files have audio energy.
-- **Test:** `test_ffmpeg_synthetic_rtp()` - feed synthetic sine RTP into designated ports; verify files exist and non-silent.
+## Phase D — Manifest & metadata
+- [ ] Enrich manifest with bridge JID, colibri_conference_id, forwarder tuples (ip,port,pt,ssrc), ssrc_history, receiver subscription flag, P2P/E2EE policy.
+- [ ] Compute checksums; record start/end timestamps and log tail.
+- [ ] Acceptance: Manifest matches files and contains transport/bridge metadata.
+- **Test:** `test_manifest_integrity()` — checksum validation and presence of transport fields.
 
-## Phase E: Manifest + storage
-- [ ] Create per-session folder `recordings/ffmpeg/<room>/<timestamp>/`.
-- [ ] Write manifest JSON with session metadata, participant↔file mapping, checksums.
-- [ ] Acceptance: Manifest present and matches files; checksum verification passes.
-- **Test:** `test_manifest_integrity()` - compute checksums and compare to manifest entries.
+## Phase E — Compose integration & env
+- [ ] Apply XMPP/Colibri env vars to controller; ensure internal-only binding.
+- [ ] Keep JVB REST `/colibri/stats` internal; no `/colibri2` HTTP expected.
+- [ ] Acceptance: `docker compose up` yields healthy services; controller `/health` 200 with auth; JVB `/colibri/stats` 200.
+- **Test:** `test_compose_health()` — services up, health endpoints reachable.
 
-## Phase F: Lifecycle & resilience
-- [x] Handle participant join/leave and SSRC churn: refresh forwarders/manifest or restart FFmpeg safely (added `/recordings/{id}/refresh` to reallocate via Colibri2 or explicit inputs).
-- [x] Handle failures: on FFmpeg crash, clean up forwarders and mark status `failed` (stop path now releases Colibri2 session and writes end timestamp).
-- [ ] Acceptance: Stop endpoint stops recording cleanly; forwarders released; status reflects outcome; SSRC changes do not orphan jobs.
-- **Test:** `test_stop_and_cleanup()` - start recording, stop via API, ensure no forwarders remain; simulate SSRC change and recover.
+## Phase F — End-to-end validation
+- [ ] Run 2–3 participant meeting; trigger recording via XMPP Colibri2; verify per-participant .mka with distinct speech; optional mix.
+- [ ] Verify SSRC churn handling (rejoin/rename) refreshes affected inputs only.
+- [ ] Acceptance: Audio isolation confirmed; manifest accurate; forwarders released on stop.
+- **Test:** `test_e2e_multitrack_xmpp()` — speech separation + manifest checks; simulate churn.
 
-## Phase G: Compose integration
-- [ ] Add `controller` and `ffmpeg-recorder` services to compose, join `meet.jitsi`, mount recordings volume.
-- [ ] Wire env defaults: secrets, JVB URLs, recording path; ensure controller binds internally (meet.jitsi/localhost only) unless explicitly published.
-- [ ] Acceptance: `docker compose up` brings new services healthy; API reachable internally; controller and Colibri2 not exposed publicly by default.
-- **Test:** `test_compose_health()` - `docker compose ps` reports healthy controller; `/health` 200.
+## Phase G — Resilience & ops
+- [ ] Handle controller/JVB restarts gracefully; retry IQs with backoff; mark failures.
+- [ ] Document P2P/E2EE disablement requirement and receiver subscription flag behavior.
+- [ ] Acceptance: Stop cleans forwarders; failures marked; restart resumes new sessions cleanly.
+- **Test:** `test_stop_and_cleanup()` — start/stop; verify no lingering forwarders; inject crash and recover.
 
-## Phase H: End-to-end validation
-- [ ] Run 2–3 participant meeting; trigger recording; each participant speaks uniquely.
-- [ ] Verify outputs: N per-participant files with distinct speech; optional mix track.
-- [ ] Acceptance: Audio isolation confirmed; manifest accurate; files playable.
-- **Test:** `test_e2e_multitrack()` - automated or manual check for speech separation; confirm manifest entries.
+## Phase H — Optional uploads/retention
+- [ ] Add S3/MinIO upload post-finalize; retention job to prune old recordings.
+- [ ] Acceptance: Upload succeeds when configured; retention removes aged folders.
+- **Test:** `test_upload_and_retention()` — sandbox bucket; verify upload + prune.
 
-## Phase I: Optional uploads/ops
-- [ ] Add optional S3/MinIO upload after finalize; include retry/backoff.
-- [ ] Add retention policy (delete after X days) and basic metrics/logging.
-- [ ] Acceptance: Upload succeeds when configured; retention job removes old folders.
-- **Test:** `test_upload_and_retention()` - mock/sandbox bucket; verify file presence then removal after retention run.
-
-## Phase J: Documentation & runbooks
-- [ ] Update README with quick start, env matrix, security notes.
-- [ ] Add troubleshooting (Colibri2 unreachable, FFmpeg errors, missing audio).
-- [ ] Acceptance: Docs standalone; references to plan/TODOs consistent; includes testing commands.
-
-## Progress log (tests/execution)
-- FastAPI TestClient with mocked FFmpeg: verified `/health` 200, auth enforced (401 without secret), start/status/stop succeed with dummy RTP inputs; manifests written to local `RECORDINGS_PATH`.
-- FFmpeg command generation validated via Python to ensure required flags and mix track present.
-- Process supervisor added: log tail captured into manifest on stop (requires real FFmpeg run to populate).
+## Phase I — Documentation & runbooks
+- [ ] Update README/plan with XMPP/IQ approach, env matrix, P2P/E2EE policy, troubleshooting (no `/colibri2` HTTP).
+- [ ] Provide sample SDP template and curl examples for stats.
+- [ ] Acceptance: Docs standalone; references consistent with this TODOs; include testing commands.
 
 ## Definition of Done
-- Start/stop/status APIs operational with auth.
-- Per-participant audio files and manifest produced for live room.
-- Compose stack runs with controller + ffmpeg services; no public exposure.
-- Testing flows (synthetic + E2E) documented and runnable.
-- Upload/retention optional but documented; defaults safe (local only).
+- Controller authenticates over XMPP and allocates/releases forwarders via Colibri2 IQs.
+- Per-participant .mka files (Opus passthrough) and enriched manifest produced for live room.
+- Compose stack healthy; controller secured with secret; JVB REST stats internal only.
+- Testing flows (synthetic SDP + E2E) documented and runnable; uploads/retention optional but documented.

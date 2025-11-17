@@ -1,9 +1,9 @@
 # Feasibility Arguments — FFmpeg Audio-Only Multitrack Recorder
 
-## Why this is feasible (pro)
+-## Why this is feasible (pro)
 - **Bypasses Jibri’s brittle UI automation**: Uses JVB Colibri2 RTP forwarders instead of Selenium/`APP.conference._room.isJoined()`, eliminating the known join failures. (Plan: control/data plane separation, controller API)
 - **Audio-only scope reduces complexity**: No video layout or heavy transcoding; Opus passthrough keeps CPU and latency low and FFmpeg graphs simple. (Plan: Key design decisions)
-- **Colibri2 provides the needed hooks**: Modern JVB exposes REST/WS to allocate RTP forwarders per endpoint, matching the requirement to pull per-participant audio. (Plan: Dependencies, Phase A)
+- **Colibri2 provides the needed hooks**: Colibri2 is an XMPP protocol used between Jicofo and JVB; the controller can participate via Prosody to manage forwarders per endpoint. (Plan: XMPP control plane)
 - **Straightforward FFmpeg wiring**: One RTP input per participant, `-c:a copy` to `.opus`, optional `amix`—all well-supported, no exotic filters. (Plan: Control flow step 4)
 - **Contained blast radius**: Services stay on the internal `meet.jitsi` network with shared-secret auth; no public UDP exposure. (Plan: Security)
 - **Testability**: Synthetic RTP feeds allow validation without live meetings; E2E tests verify channel isolation. (Plan: Testing & benchmarking)
@@ -17,6 +17,7 @@
 - **Resource limits**: Many participants mean many RTP inputs; CPU/network could bottleneck even with passthrough, especially if mixed track is enabled. (Plan: Risks – resource limits)
 - **Operational polish not yet implemented**: Controller image is a placeholder; health checks, retries, cleanup logic, and secure secret handling must be built and validated. (Plan: Deliverables)
 - **Security exposure if misconfigured**: If Colibri2 or controller ports are exposed publicly or secrets mismanaged, could allow unauthorized recording/forwarding. (Plan: Security)
+- **XMPP capability required**: Controller must authenticate to Prosody (client or external component) and implement Colibri2 IQs (allocate/update/release) aligned with the deployed jitsi-xmpp-extensions/JVB/Jicofo versions.
 
 ## Implications for TODOs
 - Emphasize early validation of Colibri2 endpoints and version (Phase A) before building controller logic.
