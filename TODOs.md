@@ -39,7 +39,7 @@ Structured for autonomous agent execution. Follow phases in order; each item has
 - **Test:** `test_manifest_integrity()` - compute checksums and compare to manifest entries.
 
 ## Phase F: Lifecycle & resilience
-- [ ] Handle participant join/leave and SSRC churn: refresh forwarders/manifest or restart FFmpeg safely.
+- [x] Handle participant join/leave and SSRC churn: refresh forwarders/manifest or restart FFmpeg safely (added `/recordings/{id}/refresh` to reallocate via Colibri2 or explicit inputs).
 - [x] Handle failures: on FFmpeg crash, clean up forwarders and mark status `failed` (stop path now releases Colibri2 session and writes end timestamp).
 - [ ] Acceptance: Stop endpoint stops recording cleanly; forwarders released; status reflects outcome; SSRC changes do not orphan jobs.
 - **Test:** `test_stop_and_cleanup()` - start recording, stop via API, ensure no forwarders remain; simulate SSRC change and recover.

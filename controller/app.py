@@ -183,3 +183,33 @@ def stop_recording(rec_id: str, x_auth_token: str | None = Header(default=None))
         raise HTTPException(status_code=404, detail="not found")
     stop_and_release(rec_id)
     return {"id": rec_id, "status": "stopped"}
+
+
+@app.post("/recordings/{rec_id}/refresh")
+async def refresh_recording(rec_id: str, request: Request, x_auth_token: str | None = Header(default=None)):
+    """
+    Basic SSRC/participant refresh: stop existing recording, optionally re-allocate Colibri2, and start a new FFmpeg job.
+    This is a coarse approach; fine-grained SSRC patching may be added later.
+    """
+    check_secret(x_auth_token)
+    current = state.get(rec_id)
+    if not current:
+        raise HTTPException(status_code=404, detail="not found")
+    body = await request.json()
+    # default to existing room if not provided
+    room = body.get("room") or current.manifest.get("room")
+    body["room"] = room
+    participants, session_meta = resolve_inputs_from_request(body)
+
+    # stop and release current session
+    stop_and_release(rec_id)
+
+    out_dir = RECORDINGS_ROOT / room / timestamp_str()
+    mix_flag = bool(body.get("mix", False))
+    manifest = build_manifest(room, participants, out_dir, rec_id, mix=mix_flag, colibri_session=session_meta.get("session_id") if session_meta else None)
+    cmd = build_ffmpeg_command(room=room, participants=participants, out_dir=out_dir, mix=mix_flag)
+    job = FFmpegJob(command=cmd, workdir=out_dir, manifest=manifest)
+    job.start()
+    state.add(job, session_meta=session_meta)
+    write_manifest(out_dir, manifest)
+    return JSONResponse({"id": rec_id, "status": job.status(), "manifest": manifest})
