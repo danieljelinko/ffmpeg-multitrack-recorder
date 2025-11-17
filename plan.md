@@ -8,7 +8,7 @@ Treat this as standalone instructions for an autonomous agent. It assumes no pri
 - Scope: audio-only multitrack (one file per participant), optional mixed-down reference; server-side only.
 
 ## System architecture
-- **Existing services (unchanged):** `web`, `prosody`, `jicofo`, `jvb` on Docker network `meet.jitsi`.
+- **Existing services (unchanged):** `web`, `prosody`, `jicofo`, `jvb` on Docker network `meet.jitsi` (all pinned to the same Jitsi tag, e.g., `JITSI_IMAGE_VERSION=stable-10590`).
 - **New services:**
   - `controller`: small API service (Python/Node) that:
     - Authenticates requests (shared secret header).
