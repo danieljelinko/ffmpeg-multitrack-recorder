@@ -2,7 +2,8 @@
 
 Structured for autonomous agent execution. Phases follow the XMPP/Colibri2 (IQ) approach; REST `/colibri2` is not expected. Acceptance criteria included.
 
-## Phase A — XMPP plumbing & policy
+-## Phase A — XMPP plumbing & policy (with matched stable tag)
+- [ ] Set a single Jitsi tag (e.g., `JITSI_IMAGE_VERSION=stable-10590`) across web/prosody/jicofo/jvb to avoid protocol drift.
 - [ ] Configure controller XMPP identity (component or client) and secrets: `XMPP_HOST`, `XMPP_PORT`, `XMPP_DOMAIN`, `XMPP_JID`/`XMPP_PASSWORD` or `XMPP_COMPONENT_SECRET`.
 - [ ] Disable P2P/E2EE for recorded rooms; document as precondition.
 - [ ] Acceptance: Controller can authenticate to Prosody and join the room MUC as a non-media occupant.
