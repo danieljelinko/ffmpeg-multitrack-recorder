@@ -1,0 +1,24 @@
+# Runtime configuration and data
+config/
+recordings/
+*.log
+
+# Docker volumes and caches
+.docker/
+
+# Environment secrets
+.env
+
+# Backup files
+*.bak
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
