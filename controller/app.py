@@ -80,7 +80,14 @@ def resolve_inputs_from_request(body: Dict[str, Any]) -> tuple[list[Dict[str, An
         return body["inputs"], None
 
     # Attempt Colibri2 allocation if participants provided
-    endpoints = body.get("participants") or []
+    endpoints_raw = body.get("participants") or []
+    endpoints: List[str] = []
+    for ep in endpoints_raw:
+        if isinstance(ep, dict):
+            if "id" in ep:
+                endpoints.append(str(ep["id"]))
+        else:
+            endpoints.append(str(ep))
     use_colibri = body.get("use_colibri", True)
     if use_colibri and endpoints:
         client: Colibri2Client = build_colibri2_from_env()
@@ -98,6 +105,7 @@ def resolve_inputs_from_request(body: Dict[str, Any]) -> tuple[list[Dict[str, An
                     "id": ep.get("id") or ep.get("endpoint") or ep.get("name"),
                     "rtp_url": f"rtp://{ip}:{port}",
                     "ssrc": audio.get("ssrc"),
+                    "forwarder": audio,
                 }
             )
         if not participants:
