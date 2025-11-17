@@ -1,6 +1,10 @@
 # Runtime configuration and data
 config/
 recordings/
+.venv/
+.uv-cache/
+test-recordings/
+__pycache__/
 *.log
 
 # Docker volumes and caches

@@ -7,7 +7,8 @@ import httpx
 class Colibri2Client:
     """
     Minimal Colibri2 client skeleton.
-    Note: Exact payloads depend on JVB version; this client is intentionally thin and may need adjustment per deployment.
+    NOTE: Colibri2 payload formats can vary by JVB version. This client uses a generic JSON shape
+    that matches the forwarder concept. Adjust the payload keys to match your deployment if JVB rejects them.
     """
 
     def __init__(self, base_url: str, ws_url: str | None = None, timeout: float = 5.0):
@@ -21,18 +22,26 @@ class Colibri2Client:
         resp.raise_for_status()
         return resp.json()
 
-    def allocate_audio_forwarders(self, room: str, endpoints: List[str]) -> List[Dict[str, Any]]:
+    def allocate_audio_forwarders(self, room: str, endpoints: List[str]) -> Dict[str, Any]:
         """
-        Placeholder for allocating audio forwarders per endpoint.
-        Real payloads vary; this returns a stub to be adapted to your JVB build.
+        Attempt to allocate audio RTP forwarders for the given endpoints.
+        Expected to return a dict containing session_id and per-endpoint RTP info.
+        The payload is intentionally generic; adjust if your JVB expects different keys.
         """
-        raise NotImplementedError("Colibri2 forwarder allocation must be implemented for your JVB version.")
+        payload = {
+            "conference": room,
+            "endpoints": [{"id": ep, "media": ["audio"]} for ep in endpoints],
+        }
+        resp = self.session.post(f"{self.base_url}/forward", json=payload)
+        resp.raise_for_status()
+        return resp.json()
 
     def release(self, session_id: str) -> None:
         """
-        Placeholder for releasing forwarders.
+        Release previously allocated forwarders.
         """
-        raise NotImplementedError("Colibri2 release must be implemented for your JVB version.")
+        resp = self.session.delete(f"{self.base_url}/forward/{session_id}")
+        resp.raise_for_status()
 
 
 def build_colibri2_from_env() -> Colibri2Client:
