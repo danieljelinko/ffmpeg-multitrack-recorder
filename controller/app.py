@@ -7,14 +7,18 @@ from typing import Dict, Any, List, Optional
 
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
+import asyncio
 
 from ffmpeg_launcher import build_ffmpeg_command, FFmpegJob, default_recordings_dir, ensure_dir
 from colibri2 import build_colibri2_from_env, Colibri2Client
+from xmpp_client import create_xmpp_bot_from_env, XMPPBot
 
 app = FastAPI(title="FFmpeg Multitrack Recorder", version="0.2.0")
 
 EXPECTED_SECRET = os.environ.get("RECORDER_API_SECRET")
 RECORDINGS_ROOT = default_recordings_dir()
+XMPP_ENABLED = bool(os.environ.get("XMPP_JID") or os.environ.get("XMPP_COMPONENT_JID"))
+BRIDGE_MUC = os.environ.get("JVB_BRIDGE_MUC", "jvbbrewery@internal-muc.meet.jitsi")
 
 
 class RecordingState:
@@ -90,6 +94,43 @@ def resolve_inputs_from_request(body: Dict[str, Any]) -> tuple[list[Dict[str, An
             endpoints.append(str(ep))
     use_colibri = body.get("use_colibri", True)
     if use_colibri and endpoints:
+        # Prefer XMPP path if XMPP is configured
+        if XMPP_ENABLED:
+            # Synchronous placeholder: connect, discover bridge, and disconnect each request.
+            bot = create_xmpp_bot_from_env(logger=lambda msg: None)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                if not bot.connect():
+                    raise HTTPException(status_code=502, detail="Failed to connect XMPP")
+                bot.process(forever=False, timeout=5)
+                if not bot.bridge_jid:
+                    raise HTTPException(status_code=502, detail="No bridge JID discovered via XMPP")
+                participants_out: List[Dict[str, Any]] = []
+                for ep_id in endpoints:
+                    alloc = loop.run_until_complete(bot.allocate_forwarder(room, ep_id))
+                    fwd = alloc.get("forwarder") or {}
+                    ip = fwd.get("ip") or "127.0.0.1"
+                    port = fwd.get("port") or 50000
+                    pt = fwd.get("pt") or 111
+                    ssrc = fwd.get("ssrc")
+                    participants_out.append(
+                        {
+                            "id": ep_id,
+                            "rtp_url": f"rtp://{ip}:{port}",
+                            "ssrc": ssrc,
+                            "pt": pt,
+                            "bridge_jid": bot.bridge_jid,
+                        }
+                    )
+                return participants_out, {"bridge_jid": bot.bridge_jid}
+            finally:
+                try:
+                    bot.disconnect()
+                except Exception:
+                    pass
+                loop.close()
+        # Fallback to HTTP Colibri client if configured (may not be available)
         client: Colibri2Client = build_colibri2_from_env()
         allocation = client.allocate_audio_forwarders(room=body["room"], endpoints=endpoints)
         session_id = allocation.get("session_id") or allocation.get("sessionId")
@@ -109,7 +150,7 @@ def resolve_inputs_from_request(body: Dict[str, Any]) -> tuple[list[Dict[str, An
                 }
             )
         if not participants:
-            raise HTTPException(status_code=502, detail="Colibri2 allocation returned no participants/ports")
+            raise HTTPException(status_code=502, detail="Colibri allocation returned no participants/ports")
         return participants, {"session_id": session_id}
 
     raise HTTPException(status_code=400, detail="Provide `inputs` with rtp_url or enable Colibri2 with participants.")

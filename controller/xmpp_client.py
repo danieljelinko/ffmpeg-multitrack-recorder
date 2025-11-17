@@ -1,9 +1,10 @@
 import asyncio
-import os
 from typing import Dict, Any, Optional, Callable
 
-from slixmpp import ClientXMPP
+from slixmpp import ClientXMPP, ComponentXMPP
 from slixmpp.xmlstream import ET
+
+from xmpp_config import XMPPSettings, load_xmpp_settings
 
 
 class Colibri2IQ:
@@ -24,20 +25,20 @@ class Colibri2IQ:
 
 
 class XMPPBot(ClientXMPP):
-    def __init__(self, jid: str, password: str, bridge_muc: str, logger: Optional[Callable[[str], None]] = None):
-        super().__init__(jid, password)
-        self.bridge_muc = bridge_muc
+    def __init__(self, settings: XMPPSettings, logger: Optional[Callable[[str], None]] = None):
+        super().__init__(settings.jid, settings.password)
+        self.settings = settings
         self.logger = logger or (lambda msg: None)
         self.bridge_jid: Optional[str] = None
         self.add_event_handler("session_start", self.start)
-        self.add_event_handler("muc::%s::got_online" % bridge_muc, self.muc_online)
+        self.add_event_handler("muc::%s::got_online" % settings.bridge_muc, self.muc_online)
 
     async def start(self, event):
         self.logger("XMPP session started")
         self.send_presence()
         await self.get_roster()
         try:
-            self.plugin["xep_0045"].join_muc(self.bridge_muc, self.boundjid.user, wait=True)
+            self.plugin["xep_0045"].join_muc(self.settings.bridge_muc, self.boundjid.user, wait=True)
         except Exception as e:
             self.logger(f"Failed to join bridge MUC: {e}")
 
@@ -65,12 +66,52 @@ class XMPPBot(ClientXMPP):
 
 
 def create_xmpp_bot_from_env(logger: Optional[Callable[[str], None]] = None) -> XMPPBot:
-    jid = os.environ.get("XMPP_JID")
-    password = os.environ.get("XMPP_PASSWORD") or os.environ.get("XMPP_COMPONENT_SECRET")
-    bridge_muc = os.environ.get("JVB_BRIDGE_MUC", "jvbbrewery@internal-muc.meet.jitsi")
-    if not jid or not password:
-        raise ValueError("XMPP_JID and XMPP_PASSWORD (or XMPP_COMPONENT_SECRET) are required")
-    bot = XMPPBot(jid=jid, password=password, bridge_muc=bridge_muc, logger=logger)
+    settings = load_xmpp_settings()
+    if settings.mode == "component":
+        bot = ComponentBot(settings=settings, logger=logger)
+        bot.register_plugin("xep_0030")
+        bot.register_plugin("xep_0045")
+        return bot
+    bot = XMPPBot(settings=settings, logger=logger)
     bot.register_plugin("xep_0030")  # Service Discovery
     bot.register_plugin("xep_0045")  # MUC for brewery discovery
     return bot
+
+
+class ComponentBot(ComponentXMPP):
+    def __init__(self, settings: XMPPSettings, logger: Optional[Callable[[str], None]] = None):
+        super().__init__(settings.jid, settings.host, settings.port, settings.password)
+        self.settings = settings
+        self.logger = logger or (lambda msg: None)
+        self.bridge_jid: Optional[str] = None
+        self.add_event_handler("session_start", self.start)
+        self.add_event_handler("muc::%s::got_online" % settings.bridge_muc, self.muc_online)
+
+    async def start(self, event):
+        self.logger("XMPP component session started")
+        try:
+            self.plugin["xep_0045"].join_muc(self.settings.bridge_muc, "recorder-comp", wait=True)
+        except Exception as e:
+            self.logger(f"Failed to join bridge MUC: {e}")
+
+    def muc_online(self, presence):
+        occupant = presence["muc"]["jid"]
+        if occupant and occupant.bare and "@internal" in occupant.bare:
+            self.bridge_jid = occupant.bare
+            self.logger(f"Discovered bridge JID: {self.bridge_jid}")
+
+    async def allocate_forwarder(self, conference_id: str, endpoint_id: str) -> Dict[str, Any]:
+        if not self.bridge_jid:
+            raise RuntimeError("Bridge JID not discovered")
+        iq = Colibri2IQ.build_allocate(conference_id, endpoint_id)
+        iq.attrib["to"] = self.bridge_jid
+        result = await self._send_iq_async(iq)
+        return {"id": endpoint_id, "bridge_jid": self.bridge_jid, "payload": result}
+
+    async def _send_iq_async(self, iq_elem: ET.Element) -> ET.Element:
+        future = self.Iq()
+        future.append(iq_elem[0])
+        future["to"] = iq_elem.attrib.get("to")
+        future["type"] = "set"
+        resp = await future.send()
+        return resp.xml
