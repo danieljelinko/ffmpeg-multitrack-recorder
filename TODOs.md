@@ -28,7 +28,7 @@ Structured for autonomous agent execution. Follow phases in order; each item has
   - [x] One input per participant (`rtp://...` with RTCP, `-protocol_whitelist rtp,udp,file,crypto`, `-use_wallclock_as_timestamps 1`, `-fflags +igndts+genpts`).
   - [x] Output per participant: `.opus` with `-c:a copy` (or AAC `.m4a` if configured, with `aresample=async=1` to avoid drift).
   - [x] Optional mixed track via `amix`.
-- [ ] Implement process supervisor: spawn FFmpeg, monitor exit, handle stop signal.
+- [x] Implement process supervisor: spawn FFmpeg, monitor exit, handle stop signal (log pump + tail stored).
 - [ ] Acceptance: Starting a session produces N audio files for N inputs; files have audio energy.
 - **Test:** `test_ffmpeg_synthetic_rtp()` - feed synthetic sine RTP into designated ports; verify files exist and non-silent.
 
@@ -66,6 +66,11 @@ Structured for autonomous agent execution. Follow phases in order; each item has
 - [ ] Update README with quick start, env matrix, security notes.
 - [ ] Add troubleshooting (Colibri2 unreachable, FFmpeg errors, missing audio).
 - [ ] Acceptance: Docs standalone; references to plan/TODOs consistent; includes testing commands.
+
+## Progress log (tests/execution)
+- FastAPI TestClient with mocked FFmpeg: verified `/health` 200, auth enforced (401 without secret), start/status/stop succeed with dummy RTP inputs; manifests written to local `RECORDINGS_PATH`.
+- FFmpeg command generation validated via Python to ensure required flags and mix track present.
+- Process supervisor added: log tail captured into manifest on stop (requires real FFmpeg run to populate).
 
 ## Definition of Done
 - Start/stop/status APIs operational with auth.

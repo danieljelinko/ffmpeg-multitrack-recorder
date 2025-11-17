@@ -113,6 +113,7 @@ def stop_and_release(rec_id: str) -> None:
     if job:
         job.stop()
         job.manifest["ended_at"] = datetime.utcnow().isoformat() + "Z"
+        job.manifest["logs_tail"] = job.tail()
         manifest_path = Path(job.workdir) / "manifest.json"
         try:
             with open(manifest_path, "w", encoding="utf-8") as f:

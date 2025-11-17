@@ -1,8 +1,10 @@
 import os
 import subprocess
+import threading
 import uuid
+from collections import deque
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 
 def default_recordings_dir() -> Path:
@@ -19,11 +21,23 @@ class FFmpegJob:
         self.workdir = workdir
         self.manifest = manifest
         self.proc: subprocess.Popen | None = None
+        self._log_lines: deque[str] = deque(maxlen=50)
+        self._log_thread: Optional[threading.Thread] = None
         self.id = manifest.get("id", str(uuid.uuid4()))
 
     def start(self) -> None:
         ensure_dir(self.workdir)
-        self.proc = subprocess.Popen(self.command, cwd=self.workdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.proc = subprocess.Popen(
+            self.command, cwd=self.workdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        self._log_thread = threading.Thread(target=self._pump_logs, daemon=True)
+        self._log_thread.start()
+
+    def _pump_logs(self) -> None:
+        if not self.proc or not self.proc.stdout:
+            return
+        for line in self.proc.stdout:
+            self._log_lines.append(line.rstrip())
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -32,12 +46,17 @@ class FFmpegJob:
                 self.proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+        if self._log_thread and self._log_thread.is_alive():
+            self._log_thread.join(timeout=2)
 
     def status(self) -> str:
         if not self.proc:
             return "not_started"
         code = self.proc.poll()
         return "running" if code is None else f"exited:{code}"
+
+    def tail(self) -> List[str]:
+        return list(self._log_lines)
 
 
 def build_ffmpeg_command(room: str, participants: List[Dict[str, Any]], out_dir: Path, mix: bool = False) -> List[str]:
