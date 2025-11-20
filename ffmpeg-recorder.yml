@@ -13,6 +13,19 @@ services:
       - JVB_COLIBRI2_URL
       - JVB_COLIBRI2_WS
       - LOG_LEVEL=info
+      # XMPP Client Mode
+      - XMPP_JID
+      - XMPP_PASSWORD
+      - XMPP_HOST
+      - XMPP_PORT
+      # XMPP Component Mode
+      - XMPP_COMPONENT_HOST
+      - XMPP_COMPONENT_PORT
+      - XMPP_COMPONENT_JID
+      - XMPP_COMPONENT_SECRET
+      - XMPP_DOMAIN
+      - JVB_BRIDGE_MUC
+      - COLIBRI2_SIMULATE
     networks:
       meet.jitsi:
     volumes:

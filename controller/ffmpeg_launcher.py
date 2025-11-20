@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import threading
 import uuid
@@ -13,6 +14,18 @@ def default_recordings_dir() -> Path:
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def sanitize_filename(name: str) -> str:
+    """Sanitize a participant name for use in filename."""
+    if not name:
+        return ""
+    # Replace spaces and special characters with underscores
+    sanitized = re.sub(r'[^\w\-]', '_', name)
+    # Remove consecutive underscores
+    sanitized = re.sub(r'_+', '_', sanitized)
+    # Remove leading/trailing underscores
+    return sanitized.strip('_')
 
 
 class FFmpegJob:
@@ -61,7 +74,9 @@ class FFmpegJob:
 
 def build_ffmpeg_command(room: str, participants: List[Dict[str, Any]], out_dir: Path, mix: bool = False) -> List[str]:
     """
-    participants: list of {id, rtp_url, rtcp_port?}
+    participants: list of {id, name?, rtp_url, rtcp_port?}
+    Generates filenames as audio-{sanitized_name}-{id}.opus if name is provided,
+    otherwise audio-{id}.opus
     """
     args: List[str] = ["ffmpeg", "-hide_banner", "-nostats", "-loglevel", "info"]
     # inputs
@@ -80,7 +95,17 @@ def build_ffmpeg_command(room: str, participants: List[Dict[str, Any]], out_dir:
     # maps
     output_paths = []
     for idx, p in enumerate(participants):
-        out_file = out_dir / f"audio-{p['id']}.opus"
+        participant_id = p['id']
+        participant_name = p.get('name', '')
+
+        # Build filename with name if available
+        if participant_name:
+            sanitized_name = sanitize_filename(participant_name)
+            filename = f"audio-{sanitized_name}-{participant_id}.opus"
+        else:
+            filename = f"audio-{participant_id}.opus"
+
+        out_file = out_dir / filename
         output_paths.append(out_file)
         args += ["-map", f"{idx}:a", "-c:a", "copy", str(out_file)]
 
