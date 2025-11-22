@@ -1,7 +1,10 @@
 import asyncio
+import json
 import logging
-from typing import Dict, Any, Optional, Callable
+import os
+from typing import Dict, Any, Optional, Callable, List
 
+import requests
 import slixmpp
 from slixmpp import ClientXMPP, ComponentXMPP
 from slixmpp.xmlstream import ET
@@ -9,7 +12,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 from aiortc.contrib.media import MediaBlackhole
 
 from xmpp_config import XMPPSettings, load_xmpp_settings
-from jingle_sdp import jingle_to_sdp, sdp_to_jingle_accept
+from jingle_sdp import jingle_to_sdp, sdp_to_jingle_accept, extract_ssrcs_from_jingle
 
 
 class Colibri2IQ:
@@ -204,6 +207,17 @@ class XMPPBot(ClientXMPP):
         # }
         self.conference_participants: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
+        # Map MUC room names to Colibri conference IDs (Bridge Session IDs)
+        # This is required because JVB expects the UUID, not the MUC name
+        self.conference_ids: Dict[str, str] = {}
+
+        # JVB REST API configuration for multitrack recording
+        self.jvb_rest_url = os.getenv("JVB_REST_URL", "http://jvb:8080")
+        self.recorder_ws_url = os.getenv("RECORDER_WS_URL", "ws://recorder:8989/record")
+
+        # Phase 3: Callback system for participant changes (join/leave)
+        self.participant_change_callbacks: List[Callable] = []
+
         # Enable slixmpp XML stream logging for debugging
         # This will show all SEND/RECV stanzas including MUC join presence
         xmpp_logger = logging.getLogger('slixmpp')
@@ -288,41 +302,15 @@ class XMPPBot(ClientXMPP):
             # Fix: Use join_muc_wait() to wait for join confirmation
             # This will raise TimeoutError if join fails, converting silent failure to loud exception
             try:
-                await self.plugin["xep_0045"].join_muc_wait(
+                self.plugin["xep_0045"].join_muc(
                     self.settings.bridge_muc,
-                    nick,
-                    timeout=10.0
+                    nick
                 )
                 self.logger(f"Successfully joined MUC {self.settings.bridge_muc}")
-
-                # Manually check MUC roster for existing occupants (including JVB)
-                await asyncio.sleep(0.5)  # Brief wait for roster to populate
-                roster = self.plugin["xep_0045"].get_roster(self.settings.bridge_muc)
-                if roster:
-                    self.logger(f"MUC roster has {len(roster)} occupants")
-                    for occupant_nick in roster:
-                        occupant_jid = roster[occupant_nick].get("jid")
-                        if occupant_jid:
-                            self.logger(f"  Occupant '{occupant_nick}': {occupant_jid}")
-                            # Check if this is the JVB
-                            if str(occupant_jid).startswith("jvb@"):
-                                self.bridge_jid = str(occupant_jid)
-                                self.logger(f"✅ Bridge discovered in roster: {self.bridge_jid}")
-                                # Trigger capability probe
-                                asyncio.create_task(self.check_bridge_capabilities())
-                                break
-                else:
-                    self.logger("MUC roster is empty or None")
-
-                # Check if we already discovered the bridge from initial MUC roster
-                if self.bridge_jid:
-                    self.logger(f"Bridge already discovered: {self.bridge_jid}")
-                    self.ready.set()
-                    self.logger("Bot ready event set (bridge discovered)")
-                else:
-                    # Wait briefly for existing occupants' presence stanzas
-                    self.logger("Waiting for bridge discovery via muc_online events...")
-                    # Don't set ready yet - let muc_online handler set it when bridge is found
+                # Roster check removed to avoid TypeError
+                # Wait briefly for existing occupants' presence stanzas
+                self.logger("Waiting for bridge discovery via muc_online events...")
+                # Don't set ready yet - let muc_online handler set it when bridge is found
 
             except asyncio.TimeoutError:
                 self.logger(f"TIMEOUT: MUC join did not complete within 10 seconds")
@@ -351,6 +339,27 @@ class XMPPBot(ClientXMPP):
         if occupant and occupant.bare and occupant.bare.startswith("jvb@"):
             self.bridge_jid = occupant.bare
             self.logger(f"Discovered bridge JID: {self.bridge_jid}")
+            
+            # Log the full presence stanza to inspect for conference IDs
+            self.logger(f"JVB Presence Payload: {presence}")
+            self.logger(f"Presence Type: {type(presence)}")
+            
+            # Check for Colibri stats
+            # Try accessing xml directly if find is missing
+            try:
+                if hasattr(presence, 'xml'):
+                    stats = presence.xml.find("{http://jitsi.org/protocol/colibri}stats")
+                elif hasattr(presence, 'find'):
+                    stats = presence.find("{http://jitsi.org/protocol/colibri}stats")
+                else:
+                    stats = None
+                    
+                if stats is not None:
+                    self.logger("Found Colibri stats in presence")
+                    for stat in stats:
+                        self.logger(f"Stat: {stat.attrib}")
+            except Exception as e:
+                self.logger(f"Error parsing stats: {e}")
 
             # Probe JVB capabilities to determine protocol support
             asyncio.create_task(self.check_bridge_capabilities())
@@ -435,13 +444,96 @@ class XMPPBot(ClientXMPP):
                 self.logger("❌ No jingle element found in IQ")
                 return
 
+            # DEBUG: Log raw Jingle XML to debug missing Bridge Session ID
+            import xml.etree.ElementTree as ET
+            raw_xml = ET.tostring(jingle, encoding='unicode')
+            self.logger(f"📜 Raw Jingle XML: {raw_xml[:500]}...") # Log first 500 chars
+
             sid = jingle.get('sid')
             initiator = jingle.get('initiator')
             self.logger(f"Session ID: {sid}")
             self.logger(f"Initiator: {initiator}")
 
+            # Extract Bridge Session ID (Colibri Conference ID)
+            # Namespace: http://jitsi.org/protocol/focus
+            bridge_session = jingle.find('{http://jitsi.org/protocol/focus}bridge-session')
+            if bridge_session is not None:
+                bs_id = bridge_session.get('id')
+                if bs_id:
+                    self.logger(f"✅ Discovered Bridge Session ID: {bs_id}")
+                    # Store it for the room
+                    # Use the IQ 'from' attribute to get the room JID (e.g. room@muc/focus)
+                    iq_from = str(iq['from'])
+                    if '@muc.' in iq_from:
+                        room_name = iq_from.split('/')[0]
+                        self.conference_ids[room_name] = bs_id
+                        
+                        # Also store short name mapping for API lookups
+                        if "@" in room_name:
+                            short_name = room_name.split("@")[0]
+                            self.conference_ids[short_name] = bs_id
+                            self.logger(f"   Mapped room {short_name} -> {bs_id}")
+                            
+                        self.logger(f"   Mapped room {room_name} -> {bs_id}")
+                    else:
+                        self.logger(f"⚠️ Could not extract room from IQ source: {iq_from}")
+
+            # Extract SSRCs from Jingle offer (Phase 1.2: SSRC Discovery)
+            ssrcs = extract_ssrcs_from_jingle(jingle)
+            if ssrcs:
+                self.logger(f"📊 Extracted SSRCs from {initiator}:")
+                for media_type, ssrc_info in ssrcs.items():
+                    self.logger(f"   {media_type}: SSRC={ssrc_info['ssrc']}, cname={ssrc_info.get('cname', 'N/A')}")
+                
+                # Map SSRC to participant in conference tracking
+                # NOTE: In Jitsi, Jicofo (focus) sends Jingle offers on behalf of participants
+                # so the initiator JID is usually "room@muc.domain/focus-id", not the participant
+                participant_updated = False
+                
+                # Extract the room name from initiator MUC JID
+                # initiator format: "testroom@muc.meet.jitsi/7ab5d390"
+                if '@muc.' in initiator:
+                    room_from_init = initiator.split('/')[0]  # "testroom@muc.meet.jitsi"
+                    
+                    if room_from_init in self.conference_participants:
+                        participants = self.conference_participants[room_from_init]
+                        
+                        # Heuristic: Assign SSRCs to most recently joined participant without SSRCs
+                        # This works because Jicofo sends session-initiate shortly after participant joins
+                        self.logger(f"   Checking {len(participants)} participants for SSRC mapping...")
+                        for jid in reversed(list(participants.keys())):
+                            participant = participants[jid]
+                            self.logger(f"   - Checking {jid} (ssrcs={bool(participant.get('ssrcs'))})")
+                            
+                            # Skip if this participant already has SSRCs or is focus/jibri
+                            if participant.get('ssrcs') or 'focus' in jid or 'jibri' in jid or jid == 'recorder-bot':
+                                self.logger(f"     Skipping {jid}")
+                                continue
+                            
+                            # Assign SSRCs to this participant
+                            participant['ssrcs'] = ssrcs
+                            nick = participant.get('nick', jid)
+                            self.logger(f"✅ Mapped SSRCs to participant {nick} (JID: {jid}) in room {room_from_init}")
+                            participant_updated = True
+                            
+                            # Phase 1.3: Automatically allocate forwarder for this participant
+                            self.logger(f"🔄 Allocating forwarder for participant {nick}...")
+                            allocation_success = await self.allocate_forwarder_for_participant(room_from_init, jid)
+                            if allocation_success:
+                                self.logger(f"🎯 Participant {nick} ready for recording with SSRC and forwarder!")
+                            
+                            break  # Only assign to one participant
+                
+                if not participant_updated:
+                    self.logger(f"⚠️ Could not find suitable participant to map SSRCs from {initiator}")
+
+            else:
+                self.logger(f"⚠️ No SSRCs found in Jingle offer from {initiator}")
+
+
             # Convert Jingle XML to SDP offer
             sdp_offer = jingle_to_sdp(jingle)
+
             self.logger(f"📄 Converted SDP offer:\n{sdp_offer}")
 
             # Create RTCPeerConnection
@@ -614,13 +706,46 @@ class XMPPBot(ClientXMPP):
     def _handle_colibri2_conference_modify(self, iq):
         """
         Handle Colibri2 conference-modify IQs from Jicofo.
-        We simply acknowledge them to prevent Jicofo from timing out and kicking us.
+        
+        This handler serves two purposes:
+        1. Acknowledge the IQ to prevent Jicofo from timing out
+        2. Extract conference ID mappings for multitrack recording
+        
+        Example Colibri2 message structure:
+        <iq type='set' from='focus@...' to='jvb@...'>
+          <conference-modify xmlns='urn:xmpp:jitsi-videobridge:colibri2'
+                             meeting-id='c15ac2a1-8537-4bf9-8e06-22e53b0f7aaa'
+                             name='testroom@muc.meet.jitsi'>
+            <!-- Conference configuration -->
+          </conference-modify>
+        </iq>
         """
         self.logger(f"Received Colibri2 conference-modify from {iq['from']}")
-        # Send an empty result IQ to acknowledge
-        # This tells Jicofo "OK, I processed your request" (even if we did nothing)
+        
+        try:
+            # Extract conference ID and room name for multitrack recording mapping
+            conf_modify = iq.xml.find('{urn:xmpp:jitsi-videobridge:colibri2}conference-modify')
+            if conf_modify is not None:
+                meeting_id = conf_modify.get('meeting-id')
+                room_name = conf_modify.get('name')
+                
+                if meeting_id and room_name:
+                    # Store the mapping: room JID -> conference ID
+                    self.conference_ids[room_name] = meeting_id
+                    self.logger(f"🔗 Mapped conference: {room_name} -> {meeting_id}")
+                else:
+                    self.logger(f"⚠️  Colibri2 message missing meeting-id or name attributes")
+            else:
+                self.logger(f"⚠️  No conference-modify element found in Colibri2 IQ")
+                
+        except Exception as e:
+            self.logger(f"⚠️  Error extracting conference ID from Colibri2 message: {e}")
+            import traceback
+            self.logger(f"Traceback: {traceback.format_exc()}")
+        
+        # Send result IQ to acknowledge (prevents Jicofo timeout)
         iq.reply().send()
-        self.logger("✅ Sent Colibri2 acknowledgement (preventing timeout)")
+        self.logger("✅ Sent Colibri2 acknowledgement")
 
     async def join_conference_muc(self, room: str):
         """
@@ -635,26 +760,41 @@ class XMPPBot(ClientXMPP):
 
         self.logger(f"🚪 Joining conference MUC: {conference_muc} as {nick}")
 
-        try:
-            # Join the MUC first (without custom presence)
-            await self.plugin["xep_0045"].join_muc_wait(
-                conference_muc,
-                nick,
-                timeout=10.0
-            )
-            self.logger(f"✅ Successfully joined conference MUC: {conference_muc}")
-        except asyncio.TimeoutError:
-            self.logger(f"⚠️ TIMEOUT: MUC join confirmation not received for {conference_muc}")
-            self.logger("Proceeding anyway as we might be joined but missed the presence echo.")
-            # Continue execution - we may still be in the room
-        except Exception as e:
-            self.logger(f"❌ Error joining conference MUC: {e}")
-            import traceback
-            self.logger(f"Traceback: {traceback.format_exc()}")
-            raise
+        # Retry logic for MUC join
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                self.logger(f"🚪 Joining conference MUC: {conference_muc} (Attempt {attempt+1}/{max_retries})")
+                # Join the MUC first (without custom presence)
+                # Use join_muc (non-blocking) instead of join_muc_wait to avoid startup hangs
+                self.plugin["xep_0045"].join_muc(
+                    conference_muc,
+                    nick
+                )
+                self.logger(f"✅ Initiated join for conference MUC: {conference_muc}")
+                # Since join_muc is non-blocking, we don't get immediate confirmation.
+                # We'll rely on presence stanzas to confirm actual join.
+                # For now, assume success and break the retry loop.
+                break # Success!
+            except Exception as e: # Catch any other potential errors during join initiation
+                self.logger(f"❌ Error initiating MUC join for {conference_muc}: {e}")
+                import traceback
+                self.logger(f"Traceback: {traceback.format_exc()}")
+                if attempt < max_retries - 1:
+                    self.logger("Retrying join in 5 seconds...")
+                    await asyncio.sleep(5.0)
+                else:
+                    self.logger("❌ Max retries reached. Proceeding with caution (might not be connected).")
+                    # Wait a bit longer to give the join more time to actually complete
+                    await asyncio.sleep(5.0)
+            except Exception as e:
+                self.logger(f"❌ Error joining conference MUC: {e}")
+                import traceback
+                self.logger(f"Traceback: {traceback.format_exc()}")
+                raise
 
         # Always send custom muted presence and register handlers
-        # (Even if join_muc_wait timed out, we may still be in the room)
+        # (Even if join_muc_wait timed out, we should be in the room now after the extra wait)
         try:
             # Immediately send custom presence with audiomuted=true and videomuted=true
             # This prevents Jicofo from allocating Colibri2 endpoints for the bot
@@ -663,14 +803,17 @@ class XMPPBot(ClientXMPP):
             
             # Add Jitsi-specific status elements to indicate muted state
             # This should prevent Jicofo from trying to allocate bridge resources
-            audiomuted = ET.SubElement(presence, '{http://jitsi.org/jitmeet/audio}audiomuted')
+            audiomuted = ET.Element('{http://jitsi.org/jitmeet/audio}audiomuted')
             audiomuted.text = 'true'
+            presence.append(audiomuted)
             
-            videomuted = ET.SubElement(presence, '{http://jitsi.org/jitmeet/video}videomuted')
+            videomuted = ET.Element('{http://jitsi.org/jitmeet/video}videomuted')
             videomuted.text = 'true'
+            presence.append(videomuted)
             
-            await presence.send()
+            presence.send()
             self.logger(f"✅ Sent muted presence to {conference_muc}")
+
             
             # Register MUC presence handlers for this conference room
             # This allows us to track participants joining/leaving
@@ -729,17 +872,6 @@ class XMPPBot(ClientXMPP):
             "ssrcs": {}
         }
         
-        # Extract JID from MUC <x> element
-        muc_user = presence.xml.find('{http://jabber.org/protocol/muc#user}x')
-        if muc_user is not None:
-            item = muc_user.find('{http://jabber.org/protocol/muc#user}item')
-            if item is not None and item.get('jid'):
-                participant_data["jid"] = item.get('jid')
-        
-        # Extract display name from <nick> element (Jitsi uses this)
-        nick_elem = presence.xml.find('{http://jabber.org/protocol/nick}nick')
-        if nick_elem is not None and nick_elem.text:
-            participant_data["display_name"] = nick_elem.text
         
         # Extract stats-id from Jitsi extension
         stats_elem = presence.xml.find('{http://jitsi.org/jitmeet}stats-id')
@@ -773,6 +905,9 @@ class XMPPBot(ClientXMPP):
         
         display_name = participant_data.get("display_name", participant_id)
         self.logger(f"👤 Participant joined [{room}]: {display_name} (ID: {participant_id})")
+        
+        # Phase 3: Notify callbacks of participant join
+        asyncio.create_task(self._notify_participant_change(room, "joined", participant_id))
         self.logger(f"   Audio muted: {participant_data['audio_muted']}, Video muted: {participant_data['video_muted']}")
 
     def _track_participant_leave(self, room: str, participant_id: str):
@@ -783,10 +918,15 @@ class XMPPBot(ClientXMPP):
             room: Full MUC JID
             participant_id: Participant identifier
         """
+        removed_participant = None
         if room in self.conference_participants and participant_id in self.conference_participants[room]:
-            participant_data = self.conference_participants[room].pop(participant_id)
-            display_name = participant_data.get("display_name", participant_id)
+            removed_participant = self.conference_participants[room].pop(participant_id)
+            display_name = removed_participant.get("display_name", participant_id)
+        if removed_participant:
             self.logger(f"👋 Participant left [{room}]: {display_name} (ID: {participant_id})")
+            
+            # Phase 3: Notify callbacks of participant leave
+            asyncio.create_task(self._notify_participant_change(room, "left", participant_id))
 
     def get_conference_participants(self, room: str) -> Dict[str, Dict[str, Any]]:
         """
@@ -800,6 +940,129 @@ class XMPPBot(ClientXMPP):
         """
         conference_muc = f"{room}@muc.{self.settings.domain}"
         return self.conference_participants.get(conference_muc, {})
+
+    async def allocate_forwarder_for_participant(self, room: str, participant_jid: str) -> bool:
+        """
+        Allocate Colibri forwarder for a specific participant in a room (Phase 1.3).
+        Updates participant dict with forwarder info.
+        
+        Returns True if successful, False otherwise.
+        """
+        if room not in self.conference_participants:
+            self.logger(f"⚠️ Cannot allocate forwarder: room {room} not in tracked conferences")
+            return False
+            
+        if participant_jid not in self.conference_participants[room]:
+            self.logger(f"⚠️ Cannot allocate forwarder: participant {participant_jid} not in room {room}")
+            return False
+            
+        participant = self.conference_participants[room][participant_jid]
+        
+        # Extract endpoint ID (resource part of JID)
+        endpoint_id = participant_jid.split('/')[-1] if '/' in participant_jid else participant_jid
+        
+        try:
+            import time
+            
+            # Wait for Bridge Session ID to be discovered
+            # This handles the race condition where Jingle offer processing (which extracts the ID)
+            # happens concurrently with this allocation call.
+            for i in range(25): # Wait up to 5 seconds
+                if room in self.conference_ids:
+                    break
+                self.logger(f"⏳ Waiting for Bridge Session ID for {room} (Attempt {i+1}/25)...")
+                await asyncio.sleep(0.2)
+            
+            # Use the correct Colibri conference ID if available, otherwise fallback to room name
+            conference_id = self.conference_ids.get(room, room)
+            if conference_id != room:
+                self.logger(f"Using Bridge Session ID {conference_id} for allocation (instead of {room})")
+            else:
+                self.logger(f"⚠️ Bridge Session ID not found for {room}, falling back to MUC name")
+            
+            allocation = await self.allocate_forwarder(conference_id, endpoint_id)
+            forwarder_info = allocation.get('forwarder', {})
+            
+            # Store forwarder details in participant
+            participant['forwarder'] = {
+                'ip': forwarder_info.get('ip'),
+                'port': forwarder_info.get('port'),
+                'allocated_at': time.time(),
+                'endpoint_id': endpoint_id
+            }
+            
+            self.logger(f"✅ Allocated forwarder for {participant.get('nick', participant_jid)}: "
+                       f"{forwarder_info.get('ip')}:{forwarder_info.get('port')}")
+            return True
+            
+        except Exception as e:
+            self.logger(f"❌ Failed to allocate forwarder for {participant_jid}: {e}")
+            import traceback
+            self.logger(f"Traceback: {traceback.format_exc()}")
+            return False
+
+    def get_participants_with_forwarders(self, room: str) -> List[Dict[str, Any]]:
+        """
+        Get all participants in room who have forwarders allocated (Phase 1.3).
+        Returns list suitable for FFmpeg command building.
+        """
+        if room not in self.conference_participants:
+            return []
+            
+        result = []
+        for jid, participant in self.conference_participants[room].items():
+            if 'forwarder' in participant and 'ssrcs' in participant:
+                # Has both SSRC and forwarder - ready for recording
+                fwd = participant['forwarder']
+                ssrc_audio = participant['ssrcs'].get('audio', {})
+                
+                result.append({
+                    'id': fwd.get('endpoint_id', jid.split('/')[-1]),
+                    'name': participant.get('nick', ''),
+                    'jid': jid,
+                    'rtp_url': f"rtp://{fwd['ip']}:{fwd['port']}",
+                    'ssrc': ssrc_audio.get('ssrc'),
+                    'forwarder': fwd
+                })
+        
+        return result
+
+    def is_in_conference(self, room: str) -> bool:
+        """
+        Check if bot has joined a conference MUC (Phase 2).
+        
+        Args:
+            room: Conference room name (e.g., "my-meeting")
+            
+        Returns:
+            True if bot is in the conference, False otherwise
+        """
+        conference_muc = f"{room}@muc.{self.settings.domain}"
+        return conference_muc in self.conference_participants
+
+    def register_participant_change_callback(self, callback: Callable):
+        """
+        Register callback for participant join/leave events (Phase 3).
+        
+        Args:
+            callback: Async function with signature: (room: str, action: str, participant_jid: str)
+                     action will be "joined" or "left"
+        """
+        self.participant_change_callbacks.append(callback)
+        self.logger(f"Registered participant change callback: {callback.__name__}")
+
+    async def _notify_participant_change(self, room: str, action: str, participant_jid: str):
+        """Notify all registered callbacks of participant change (Phase 3)."""
+        for callback in self.participant_change_callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(room, action, participant_jid)
+                else:
+                    callback(room, action, participant_jid)
+            except Exception as e:
+                self.logger(f"❌ Error in participant change callback: {e}")
+                import traceback
+                self.logger(f"Traceback: {traceback.format_exc()}")
 
     def _on_conference_participant_online(self, room: str, presence):
         """
@@ -1036,6 +1299,208 @@ class XMPPBot(ClientXMPP):
         future["type"] = "set"
         resp = await future.send()
         return resp.xml
+
+    def _resolve_conference_id_via_debug(self, room_name: str) -> Optional[str]:
+        """
+        Resolve JVB conference ID using the JVB debug endpoint.
+        This is a fallback when Jingle/Colibri2 mapping fails.
+        """
+        try:
+            debug_url = f"{self.jvb_rest_url}/debug"
+            self.logger(f"🔍 Resolving conference ID via {debug_url}")
+            resp = requests.get(debug_url, timeout=5)
+            if resp.status_code != 200:
+                self.logger(f"❌ JVB debug endpoint returned {resp.status_code}")
+                return None
+            
+            data = resp.json()
+            conferences = data.get("conferences", {})
+            
+            # Normalize room name
+            target_room = room_name
+            if "@" in target_room:
+                target_room_short = target_room.split("@")[0]
+            else:
+                target_room_short = target_room
+                
+            for conf_id, conf_data in conferences.items():
+                # Check 'name' field (usually full MUC JID)
+                conf_name = conf_data.get("name", "")
+                
+                # Match against full name or short name
+                if conf_name == target_room or \
+                   (conf_name and conf_name.split("@")[0] == target_room_short):
+                    
+                    # Found it!
+                    # Prefer 'meeting_id' if available (Colibri2 UUID), else 'id'
+                    meeting_id = conf_data.get("meeting_id")
+                    internal_id = conf_data.get("id")
+                    
+                    final_id = meeting_id or internal_id
+                    self.logger(f"✅ Resolved {room_name} -> {final_id} (via debug)")
+                    
+                    # Cache it
+                    self.conference_ids[target_room_short] = final_id
+                    if "@" in conf_name:
+                        self.conference_ids[conf_name] = final_id
+                        
+                    return final_id
+            
+            self.logger(f"❌ Room {room_name} not found in JVB debug output")
+            return None
+            
+        except Exception as e:
+            self.logger(f"❌ Error resolving via debug: {e}")
+            return None
+
+    async def start_multitrack_recording(self, room_name: str) -> bool:
+        """
+        Start multitrack recording via JVB REST API.
+        """
+        # Normalize room name (remove domain if present)
+        if "@" in room_name:
+            room_short = room_name.split("@")[0]
+        else:
+            room_short = room_name
+            
+        self.logger(f"🎙️  Request to start recording for room: {room_short}")
+        
+        # Try to find conference ID
+        conference_id = None
+        
+        # 1. Check existing mapping (from Jingle)
+        if room_short in self.conference_ids:
+            conference_id = self.conference_ids[room_short]
+            
+        # 2. If not found, wait a bit (retry loop)
+        if not conference_id:
+            for i in range(5):
+                if room_short in self.conference_ids:
+                    conference_id = self.conference_ids[room_short]
+                    break
+                self.logger(f"⏳ Waiting for conference ID mapping for {room_short} (attempt {i+1}/5)...")
+                await asyncio.sleep(0.5)
+        
+        # 3. If still not found, try debug endpoint
+        if not conference_id:
+            self.logger(f"⚠️ Conference ID not found via Jingle, trying debug endpoint...")
+            conference_id = self._resolve_conference_id_via_debug(room_short)
+            
+        if not conference_id:
+            self.logger(f"❌ Could not find conference ID for room {room_short}")
+            return False
+            
+        self.logger(f"✅ Using conference ID: {conference_id}")
+        
+        # Construct recorder WebSocket URL with room parameter
+        recorder_url = f"{self.recorder_ws_url}?room={room_short}"
+        
+        payload = {
+            "connects": [
+                {
+                    "url": recorder_url,
+                    "protocol": "mediajson",
+                    "audio": True,
+                    "video": False
+                }
+            ]
+        }
+        
+        url = f"{self.jvb_rest_url}/colibri/v2/conferences/{conference_id}"
+        
+        try:
+            self.logger(f"🎙️  Starting multitrack recording for {conference_id} via {url}")
+            self.logger(f"📡 Recorder WebSocket URL: {recorder_url}")
+            
+            response = requests.patch(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                self.logger(f"✅ Successfully started multitrack recording")
+                return True
+            elif response.status_code == 404:
+                self.logger(f"❌ JVB returned 404. ID might be wrong. Retrying via debug resolution...")
+                # Force debug resolution
+                new_id = self._resolve_conference_id_via_debug(room_short)
+                if new_id and new_id != conference_id:
+                    self.logger(f"🔄 Retrying with new ID: {new_id}")
+                    url = f"{self.jvb_rest_url}/colibri/v2/conferences/{new_id}"
+                    response = requests.patch(
+                        url,
+                        json=payload,
+                        headers={"Content-Type": "application/json"},
+                        timeout=10
+                    )
+                    if response.status_code == 200:
+                        self.logger(f"✅ Successfully started multitrack recording (on retry)")
+                        return True
+            
+            self.logger(f"❌ Failed to start recording: HTTP {response.status_code}")
+            self.logger(f"Response: {response.text}")
+            return False
+                
+        except Exception as e:
+            self.logger(f"❌ Error calling JVB REST API: {e}")
+            import traceback
+            self.logger(f"Traceback: {traceback.format_exc()}")
+            return False
+
+    async def stop_multitrack_recording(self, room_name: str) -> bool:
+        """
+        Stop multitrack recording by sending empty connects array.
+        """
+        # Normalize room name
+        if "@" in room_name:
+            room_short = room_name.split("@")[0]
+        else:
+            room_short = room_name
+            
+        # Look up conference ID
+        conference_id = self.conference_ids.get(room_short)
+        
+        # Fallback to debug resolution if not found
+        if not conference_id:
+             conference_id = self._resolve_conference_id_via_debug(room_short)
+        
+        if not conference_id:
+            self.logger(f"❌ Could not find conference ID for room {room_short} to stop recording")
+            return False
+            
+        self.logger(f"🛑 Request to stop recording for room: {room_short} (ID: {conference_id})")
+        
+        # Empty connects array stops the exporter
+        payload = {
+            "connects": []
+        }
+        
+        url = f"{self.jvb_rest_url}/colibri/v2/conferences/{conference_id}"
+        
+        try:
+            self.logger(f"🛑 Stopping multitrack recording for {conference_id}")
+            response = requests.patch(url, json=payload, timeout=10)
+            
+            if response.status_code == 200:
+                self.logger("✅ Successfully stopped multitrack recording")
+                return True
+            elif response.status_code == 404:
+                # Retry with debug resolution
+                new_id = self._resolve_conference_id_via_debug(room_short)
+                if new_id and new_id != conference_id:
+                    url = f"{self.jvb_rest_url}/colibri/v2/conferences/{new_id}"
+                    response = requests.patch(url, json=payload, timeout=10)
+                    if response.status_code == 200:
+                        self.logger("✅ Successfully stopped multitrack recording (on retry)")
+                        return True
+                        
+            self.logger(f"❌ Failed to stop recording: HTTP {response.status_code}")
+            return False
+        except Exception as e:
+            self.logger(f"❌ Error stopping recording: {e}")
+            return False
 
 
 def create_xmpp_bot_from_env(logger: Optional[Callable[[str], None]] = None) -> XMPPBot:

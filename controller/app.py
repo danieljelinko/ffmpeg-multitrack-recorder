@@ -34,11 +34,15 @@ class RecordingState:
     def __init__(self):
         self.jobs: Dict[str, FFmpegJob] = {}
         self.sessions: Dict[str, Dict[str, Any]] = {}
+        self.room_to_recording: Dict[str, str] = {}  # Phase 3: room -> rec_id mapping
 
     def add(self, job: FFmpegJob, session_meta: Optional[Dict[str, Any]] = None):
         self.jobs[job.id] = job
         if session_meta:
             self.sessions[job.id] = session_meta
+            # Phase 3: Track room mapping for dynamic participant handling
+            if room := session_meta.get("room"):
+                self.room_to_recording[room] = job.id
 
     def get(self, rec_id: str) -> FFmpegJob | None:
         return self.jobs.get(rec_id)
@@ -46,7 +50,20 @@ class RecordingState:
     def get_session(self, rec_id: str) -> Optional[Dict[str, Any]]:
         return self.sessions.get(rec_id)
 
+    def get_recording_for_room(self, room: str) -> Optional[str]:
+        """Phase 3: Get active recording ID for a room."""
+        return self.room_to_recording.get(room)
+
     def remove(self, rec_id: str):
+        # Phase 3: Also remove from room mapping
+        room_to_remove = None
+        for room, rid in self.room_to_recording.items():
+            if rid == rec_id:
+                room_to_remove = room
+                break
+        if room_to_remove:
+            del self.room_to_recording[room_to_remove]
+            
         if rec_id in self.sessions:
             del self.sessions[rec_id]
         if rec_id in self.jobs:
@@ -54,6 +71,61 @@ class RecordingState:
 
 
 state = RecordingState()
+
+
+async def handle_participant_change(room: str, action: str, participant_jid: str):
+    """
+    Phase 3: Handle participant join/leave during active recording.
+    Restarts recording with updated participant list to create new segment.
+    """
+    # Check if this room has an active recording
+    rec_id = state.get_recording_for_room(room)
+    if not rec_id:
+        return  # No active recording for this room
+    
+    current_job = state.get(rec_id)
+    if not current_job or current_job.status() != "running":
+        return  # Recording not running or doesn't exist
+    
+    print(f"[DYNAMIC] Participant {action} in {room}, restarting recording {rec_id}")
+    
+    # Stop current segment
+    current_job.stop()
+    
+    # Get updated participant list from bot
+    from fastapi import FastAPI
+    app_instance = FastAPI._instances[0] if hasattr(FastAPI, '_instances') else None
+    if not app_instance or not hasattr(app_instance.state, 'xmpp_bot'):
+        print(f"[DYNAMIC] Cannot access bot to get updated participants")
+        return
+    
+    bot = app_instance.state.xmpp_bot
+    participants = bot.get_participants_with_forwarders(room)
+    
+    if not participants:
+        print(f"[DYNAMIC] No participants left in {room}, stopping recording")
+        await stop_and_release(rec_id, app_instance.state)
+        return
+    
+    # Start new segment with updated participants
+    new_segment_dir = RECORDINGS_ROOT / room / timestamp_str()
+    mix_flag = current_job.manifest.get("mix", False)
+    manifest = build_manifest(
+        room, participants, new_segment_dir, rec_id, 
+        mix=mix_flag,
+        colibri_session=None
+    )
+    
+    cmd = build_ffmpeg_command(room=room, participants=participants, out_dir=new_segment_dir, mix=mix_flag)
+    new_job = FFmpegJob(command=cmd, workdir=new_segment_dir, manifest=manifest)
+    new_job.start()
+    
+    # Update state (reuse same rec_id for continuity)
+    state.jobs[rec_id] = new_job
+    write_manifest(new_segment_dir, manifest)
+    
+    print(f"[DYNAMIC] Restarted recording in new segment: {new_segment_dir}")
+    print(f"[DYNAMIC] New segment has {len(participants)} participants")
 
 
 @asynccontextmanager
@@ -72,6 +144,10 @@ async def lifespan(app: FastAPI):
             print("[STARTUP] Waiting for XMPP bot to be ready...")
             await asyncio.wait_for(bot.ready.wait(), timeout=10.0)
             print("[STARTUP] XMPP bot ready!")
+            
+            # Phase 3: Register dynamic participant handling callback
+            bot.register_participant_change_callback(handle_participant_change)
+            print("[STARTUP] Registered dynamic participant handler")
         except asyncio.TimeoutError:
             print("[STARTUP] WARNING: XMPP bot failed to become ready within 10s")
             app.state.xmpp_bot = None
@@ -163,9 +239,36 @@ async def resolve_inputs_from_request(body: Dict[str, Any], app_state) -> tuple[
     """
     Returns (participants, session_meta). participants: list[{id, rtp_url, ssrc?}]
     session_meta may include colibri session id for later release.
+    
+    Phase 2: Now supports automatic participant discovery from Phase 1 tracking.
+    If bot is in conference and participants have forwarders, they are used automatically.
     """
     if "inputs" in body:
         return body["inputs"], None
+
+    # Phase 2: Automatic participant discovery
+    # Check if bot is in conference and has participants with forwarders
+    room = body.get("room")
+    if room and XMPP_ENABLED and not SIMULATION_MODE and hasattr(app_state, 'xmpp_bot'):
+        bot: XMPPBot = app_state.xmpp_bot
+        
+        if bot and bot.ready.is_set() and bot.is_in_conference(room):
+            # Try to get automatically tracked participants (Phase 1.1-1.3)
+            auto_participants = bot.get_participants_with_forwarders(room)
+            
+            if auto_participants:
+                print(f"[AUTO-DISCOVERY] Found {len(auto_participants)} participants with forwarders in {room}")
+                for p in auto_participants:
+                    print(f"  - {p.get('name', p['id'])}: {p['rtp_url']} (SSRC: {p.get('ssrc')})")
+                
+                return auto_participants, {
+                    "auto_discovered": True,
+                    "room": room,
+                    "participant_count": len(auto_participants),
+                    "via_xmpp": True
+                }
+            else:
+                print(f"[AUTO-DISCOVERY] Bot is in {room} but no participants with forwarders found yet")
 
     # Attempt Colibri2 allocation if participants provided
     endpoints_raw = body.get("participants") or []
@@ -180,6 +283,7 @@ async def resolve_inputs_from_request(body: Dict[str, Any], app_state) -> tuple[
                 })
         else:
             endpoint_objects.append({"id": str(ep), "name": ""})
+
 
     use_colibri = body.get("use_colibri", True)
     if use_colibri and endpoint_objects:
@@ -332,7 +436,30 @@ async def health(request: Request):
 
 @app.post("/recordings")
 async def start_recording(request: Request, x_auth_token: str | None = Header(default=None)):
+    """
+    Start recording a conference.
+    
+    Phase 2: Supports automatic participant discovery!
+    
+    Body:
+        room (required): Conference room name
+        mix (optional): Create mixed audio file (default: false)
+        participants (optional): Manual participant list
+        
+    If bot is in the conference and participants have joined with allocated
+    forwarders (Phase 1), they will be automatically discovered. No need to 
+    specify participants manually!
+    
+    Example (automatic):
+        POST /recordings
+        {"room": "my-meeting", "mix": true}
+        
+    Example (manual):
+        POST /recordings
+        {"room": "my-meeting", "participants": [{"id": "p1", "name": "Alice"}]}
+    """
     check_secret(x_auth_token)
+
     body = await request.json()
     room = body.get("room")
     if not room:
@@ -436,3 +563,131 @@ async def test_join_conference(request: Request, x_auth_token: str | None = Head
         })
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to join conference: {str(e)}")
+
+
+@app.post("/api/record/start")
+async def api_start_recording(request: Request, x_auth_token: str | None = Header(default=None)):
+    """
+    Start multitrack recording via JVB REST API.
+    
+    This is a simplified endpoint that:
+    1. Joins the conference MUC (if not already joined)
+    2. Calls JVB's Colibri2 REST API to trigger media-json exporter
+    3. JVB opens WebSocket to recorder
+    4. Recorder receives individual participant audio streams
+    
+    Body:
+        room_id (required): Conference room name (e.g., "testroom" or "testroom@conference.meet.jitsi")
+        
+    Returns:
+        {
+            "status": "recording"|"error",
+            "room": "...",
+            "message": "..."
+        }
+    """
+    check_secret(x_auth_token)
+    
+    if SIMULATION_MODE:
+        return JSONResponse({"error": "Cannot use multitrack recording in simulation mode"}, status_code=400)
+    
+    body = await request.json()
+    room_id = body.get("room_id")
+    
+    if not room_id:
+        raise HTTPException(status_code=400, detail="Missing 'room_id' parameter")
+    
+    bot: XMPPBot = request.app.state.xmpp_bot
+    
+    if not bot or not bot.ready.is_set():
+        raise HTTPException(status_code=503, detail="XMPP bot not ready")
+    
+    # Construct full room JID
+    if "@" not in room_id:
+        full_room_jid = f"{room_id}@muc.{bot.settings.domain}"
+    else:
+        full_room_jid = room_id
+    
+    try:
+        # Step 1: Join MUC (if not already in it)
+        if not bot.is_in_conference(full_room_jid):
+            print(f"[API] Joining MUC: {full_room_jid}")
+            await bot.join_conference_muc(room_id.split("@")[0])
+            
+            # Wait for conference to be established
+            await asyncio.sleep(3)
+        else:
+            print(f"[API] Already in MUC: {full_room_jid}")
+        
+        # Step 2: Start multitrack recording via JVB REST API
+        success = await bot.start_multitrack_recording(full_room_jid)
+        
+        if not success:
+            return JSONResponse({
+                "status": "error",
+                "room": room_id,
+                "message": "Failed to start multitrack recording (check JVB REST API)"
+            }, status_code=500)
+        
+        return JSONResponse({
+            "status": "recording",
+            "room": room_id,
+            "message": "Multitrack recording started successfully"
+        })
+        
+    except Exception as e:
+        print(f"[API] Error starting recording: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to start recording: {str(e)}")
+
+
+@app.post("/api/record/stop")
+async def api_stop_recording(request: Request, x_auth_token: str | None = Header(default=None)):
+    """
+    Stop multitrack recording and leave conference.
+    
+    Body:
+        room_id (required): Conference room name
+        
+    Returns:
+        {
+            "status": "stopped",
+            "room": "..."
+        }
+    """
+    check_secret(x_auth_token)
+    
+    body = await request.json()
+    room_id = body.get("room_id")
+    
+    if not room_id:
+        raise HTTPException(status_code=400, detail="Missing 'room_id' parameter")
+    
+    bot: XMPPBot = request.app.state.xmpp_bot
+    
+    if not bot or not bot.ready.is_set():
+        raise HTTPException(status_code=503, detail="XMPP bot not ready")
+    
+    # Construct full room JID
+    if "@" not in room_id:
+        full_room_jid = f"{room_id}@muc.{bot.settings.domain}"
+    else:
+        full_room_jid = room_id
+    
+    try:
+        # Step 1: Stop multitrack recording
+        await bot.stop_multitrack_recording(full_room_jid)
+        
+        # Step 2: Leave MUC
+        if bot.is_in_conference(full_room_jid):
+            await bot.leave_conference_muc(room_id.split("@")[0])
+        
+        return JSONResponse({
+            "status": "stopped",
+            "room": room_id
+        })
+        
+    except Exception as e:
+        print(f"[API] Error stopping recording: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to stop recording: {str(e)}")

@@ -26,14 +26,16 @@ services:
       - XMPP_DOMAIN
       - JVB_BRIDGE_MUC
       - COLIBRI2_SIMULATE
+    volumes:
+      - ./controller:/app
+      - ${RECORDINGS_PATH:-./recordings}:/recordings:Z
     networks:
       meet.jitsi:
-    volumes:
-      - ${RECORDINGS_PATH:-./recordings}:/recordings:Z
     ports:
       # Expose only if you need host access; otherwise rely on internal Docker network.
       - "127.0.0.1:${RECORDER_API_PORT:-8288}:8080"
 
 networks:
   meet.jitsi:
-    external: true
+    external:
+      name: jitsi-multitrack-recording_meet.jitsi

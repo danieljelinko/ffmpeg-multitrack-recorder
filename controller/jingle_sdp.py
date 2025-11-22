@@ -142,6 +142,68 @@ def jingle_to_sdp(jingle_element: ET.Element) -> str:
     return "\r\n".join(sdp_lines) + "\r\n"
 
 
+def extract_ssrcs_from_jingle(jingle_element: ET.Element) -> Dict[str, Dict[str, any]]:
+    """
+    Extract SSRC values from Jingle session-initiate for participant tracking.
+    
+    Args:
+        jingle_element: The <jingle> XML element from session-initiate
+        
+    Returns:
+        Dict mapping media type to SSRC info:
+        {
+            "audio": {"ssrc": 12345678, "cname": "user-xyz", "msid": "..."},
+            "video": {"ssrc": 87654321, "cname": "user-xyz", "msid": "..."}
+        }
+    """
+    ssrcs = {}
+    
+    # Extract all content elements (audio/video)
+    contents = jingle_element.findall('{urn:xmpp:jingle:1}content')
+    
+    for content in contents:
+        # Get description to determine media type
+        description = content.find('{urn:xmpp:jingle:apps:rtp:1}description')
+        if description is None:
+            continue
+            
+        media_type = description.get('media')  # "audio" or "video"
+        
+        # Find source elements (XEP-0339: Source-Specific Media Attributes in Jingle)
+        # Namespace: urn:xmpp:jingle:apps:rtp:ssma:0
+        sources = description.findall('{urn:xmpp:jingle:apps:rtp:ssma:0}source')
+        
+        for source in sources:
+            ssrc_value = source.get('ssrc')
+            if not ssrc_value:
+                continue
+                
+            # Extract SSRC parameters (cname, msid, mslabel, etc.)
+            params = {}
+            for param in source.findall('{urn:xmpp:jingle:apps:rtp:ssma:0}parameter'):
+                param_name = param.get('name')
+                param_value = param.get('value')
+                if param_name and param_value:
+                    params[param_name] = param_value
+            
+            # Store first SSRC found for this media type
+            # (Multiple SSRCs per media type possible for simulcast, but we'll use primary)
+            if media_type not in ssrcs:
+                try:
+                    ssrcs[media_type] = {
+                        'ssrc': int(ssrc_value),
+                        'cname': params.get('cname', ''),
+                        'msid': params.get('msid', ''),
+                        'mslabel': params.get('mslabel', ''),
+                        'label': params.get('label', '')
+                    }
+                except ValueError:
+                    # Invalid SSRC format, skip
+                    pass
+    
+    return ssrcs
+
+
 def sdp_to_jingle_accept(sdp_answer: str, session_id: str, initiator: str, responder: str) -> ET.Element:
     """
     Converts aiortc's Local SDP Answer into a robust Jingle session-accept packet.
