@@ -1400,7 +1400,8 @@ class XMPPBot(ClientXMPP):
                 {
                     "url": recorder_url,
                     "protocol": "mediajson",
-                    "audio": True,
+                "type": "recorder",
+                "audio": True,
                     "video": False
                 }
             ]

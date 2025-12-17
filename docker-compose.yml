@@ -497,7 +497,7 @@ services:
             - SENTRY_ENVIRONMENT
             - SENTRY_RELEASE
             - COLIBRI_REST_ENABLED=true
-            - JVB_ENABLE_APIS=rest,colibri
+            - JVB_ENABLE_APIS=rest,colibri,colibri2
             - SHUTDOWN_REST_ENABLED
             - TZ
             - VIDEOBRIDGE_MAX_MEMORY
@@ -507,6 +507,24 @@ services:
             - XMPP_PORT
         depends_on:
             - prosody
+        networks:
+            meet.jitsi:
+
+    # Multitrack Recorder
+    recorder:
+        image: jitsi/jitsi-multitrack-recorder:latest
+        container_name: jitsi_multitrack_recorder
+        restart: unless-stopped
+        ports:
+            - '8989:8989'
+        volumes:
+            - ./recordings:/recordings:Z
+            - ./scripts/finalize-recording.sh:/scripts/finalize-recording.sh:ro
+        environment:
+            - RECORDING_DIR=/recordings
+            - ENABLE_AUTO_RECORDING=${ENABLE_AUTO_RECORDING:-1}
+            - FINALIZE_SCRIPT=/scripts/finalize-recording.sh
+            - TZ=${TZ:-UTC}
         networks:
             meet.jitsi:
 

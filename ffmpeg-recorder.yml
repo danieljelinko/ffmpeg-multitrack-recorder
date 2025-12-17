@@ -38,4 +38,4 @@ services:
 networks:
   meet.jitsi:
     external:
-      name: jitsi-multitrack-recording_meet.jitsi
+      name: ffmpeg-multitrack-recorder_meet.jitsi
