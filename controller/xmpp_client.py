@@ -2,6 +2,9 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, Any, Optional, Callable, List
 
 import requests
@@ -13,164 +16,6 @@ from aiortc.contrib.media import MediaBlackhole
 
 from xmpp_config import XMPPSettings, load_xmpp_settings
 from jingle_sdp import jingle_to_sdp, sdp_to_jingle_accept, extract_ssrcs_from_jingle
-
-
-class Colibri2IQ:
-    """
-    Colibri2 IQ builder/parser for jitsi-videobridge stable-10590.
-    Implements conference-modify/conference-modified IQ stanzas.
-    """
-
-    # Based on jitsi-xmpp-extensions Colibri2 namespace
-    NAMESPACE = "urn:xmpp:jitsi-videobridge:colibri2"
-    ICE_UDP_NS = "urn:xmpp:jingle:transports:ice-udp:1"
-    SOURCES_NS = "urn:xmpp:jitsi:colibri2:sources"
-
-    @staticmethod
-    def build_allocate(conference_id: str, endpoint_id: str) -> ET.Element:
-        """
-        Build a conference-modify IQ to allocate an audio endpoint.
-
-        This requests JVB to create/allocate an endpoint with audio media
-        and transport configured for receiving RTP.
-        """
-        iq = ET.Element("{jabber:client}iq", {"type": "set"})
-
-        # conference-modify element with meeting-id and create flag
-        conf_modify = ET.SubElement(
-            iq,
-            f"{{{Colibri2IQ.NAMESPACE}}}conference-modify",
-            {
-                "meeting-id": conference_id,
-                "create": "true"
-            }
-        )
-
-        # endpoint element
-        endpoint = ET.SubElement(
-            conf_modify,
-            f"{{{Colibri2IQ.NAMESPACE}}}endpoint",
-            {
-                "id": endpoint_id,
-                "create": "true"
-            }
-        )
-
-        # media element for audio
-        media = ET.SubElement(
-            endpoint,
-            f"{{{Colibri2IQ.NAMESPACE}}}media",
-            {"type": "audio"}
-        )
-
-        # Add common Opus payload type
-        ET.SubElement(
-            media,
-            f"{{{Colibri2IQ.NAMESPACE}}}payload-type",
-            {
-                "id": "111",
-                "name": "opus",
-                "clockrate": "48000",
-                "channels": "2"
-            }
-        )
-
-        # transport element (required for RTP forwarders)
-        transport = ET.SubElement(
-            endpoint,
-            f"{{{Colibri2IQ.NAMESPACE}}}transport"
-        )
-
-        return iq
-
-    @staticmethod
-    def parse_allocate_response(response_xml: ET.Element) -> Dict[str, Any]:
-        """
-        Parse conference-modified IQ response from JVB.
-
-        Extracts IP, port, SSRC, and payload type from the response.
-        """
-        # Find conference-modified element
-        conf_modified = response_xml.find(f".//{{{Colibri2IQ.NAMESPACE}}}conference-modified")
-        if conf_modified is None:
-            raise ValueError("No conference-modified element in response")
-
-        # Find endpoint
-        endpoint = conf_modified.find(f".//{{{Colibri2IQ.NAMESPACE}}}endpoint")
-        if endpoint is None:
-            raise ValueError("No endpoint in response")
-
-        endpoint_id = endpoint.get("id")
-
-        # Extract transport info - look for ICE candidate
-        candidate = endpoint.find(f".//{{{Colibri2IQ.ICE_UDP_NS}}}candidate")
-        if candidate is not None:
-            ip = candidate.get("ip")
-            port = int(candidate.get("port"))
-        else:
-            # Fallback: try to find transport with relay info
-            transport = endpoint.find(f".//{{{Colibri2IQ.NAMESPACE}}}transport")
-            # If no candidate, this might be a relay or we need to handle differently
-            ip = "127.0.0.1"  # Default fallback
-            port = 50000  # Default fallback
-
-        # Extract SSRC from sources
-        ssrc = None
-        source = endpoint.find(f".//{{{Colibri2IQ.SOURCES_NS}}}source")
-        if source is not None:
-            ssrc_str = source.get("id")
-            if ssrc_str:
-                try:
-                    ssrc = int(ssrc_str)
-                except ValueError:
-                    pass
-
-        # Extract payload type
-        pt = 111  # Default Opus
-        payload_type = endpoint.find(f".//{{{Colibri2IQ.NAMESPACE}}}payload-type")
-        if payload_type is not None:
-            pt_str = payload_type.get("id")
-            if pt_str:
-                try:
-                    pt = int(pt_str)
-                except ValueError:
-                    pass
-
-        return {
-            "endpoint_id": endpoint_id,
-            "ip": ip,
-            "port": port,
-            "ssrc": ssrc,
-            "pt": pt
-        }
-
-    @staticmethod
-    def build_release(conference_id: str, endpoint_id: str) -> ET.Element:
-        """
-        Build a conference-modify IQ to release/expire an endpoint.
-
-        This requests JVB to remove an endpoint from a conference.
-        """
-        iq = ET.Element("{jabber:client}iq", {"type": "set"})
-
-        # conference-modify element with meeting-id (no create flag)
-        conf_modify = ET.SubElement(
-            iq,
-            f"{{{Colibri2IQ.NAMESPACE}}}conference-modify",
-            {"meeting-id": conference_id}
-        )
-
-        # endpoint element with expire flag
-        ET.SubElement(
-            conf_modify,
-            f"{{{Colibri2IQ.NAMESPACE}}}endpoint",
-            {
-                "id": endpoint_id,
-                "expire": "true"
-            }
-        )
-
-        return iq
 
 
 class XMPPBot(ClientXMPP):
@@ -214,6 +59,17 @@ class XMPPBot(ClientXMPP):
         # JVB REST API configuration for multitrack recording
         self.jvb_rest_url = os.getenv("JVB_REST_URL", "http://jvb:8080")
         self.recorder_ws_url = os.getenv("RECORDER_WS_URL", "ws://recorder:8989/record")
+
+        # Auto-recording configuration
+        self.record_video = os.getenv("RECORD_VIDEO", "false").lower() in ("1", "true", "yes")
+        self.min_participants = int(os.getenv("MIN_PARTICIPANTS", "2"))
+        self.recordings_dir = os.getenv("RECORDINGS_DIR", "/recordings")
+        self.auto_recording_enabled = os.getenv("ENABLE_AUTO_RECORDING", "0") in ("1", "true", "yes")
+        self.poll_interval = int(os.getenv("POLL_INTERVAL", "5"))
+
+        # Auto-recording state: meeting_id -> {room_name, started_at, endpoints}
+        self.auto_recordings: dict[str, dict[str, Any]] = {}
+        self._auto_recording_task: Optional[asyncio.Task] = None
 
         # Phase 3: Callback system for participant changes (join/leave)
         self.participant_change_callbacks: List[Callable] = []
@@ -515,13 +371,6 @@ class XMPPBot(ClientXMPP):
                             nick = participant.get('nick', jid)
                             self.logger(f"✅ Mapped SSRCs to participant {nick} (JID: {jid}) in room {room_from_init}")
                             participant_updated = True
-                            
-                            # Phase 1.3: Automatically allocate forwarder for this participant
-                            self.logger(f"🔄 Allocating forwarder for participant {nick}...")
-                            allocation_success = await self.allocate_forwarder_for_participant(room_from_init, jid)
-                            if allocation_success:
-                                self.logger(f"🎯 Participant {nick} ready for recording with SSRC and forwarder!")
-                            
                             break  # Only assign to one participant
                 
                 if not participant_updated:
@@ -871,8 +720,17 @@ class XMPPBot(ClientXMPP):
             "joined_at": datetime.utcnow().isoformat() + "Z",
             "ssrcs": {}
         }
-        
-        
+
+        # Extract display name from nick element (XEP-0172 or Jitsi extension)
+        nick_elem = presence.xml.find('{http://jabber.org/protocol/nick}nick')
+        if nick_elem is not None and nick_elem.text:
+            participant_data["display_name"] = nick_elem.text
+        else:
+            # Fallback: Jitsi-specific nick element
+            nick_elem2 = presence.xml.find('{http://jitsi.org/jitmeet}nick')
+            if nick_elem2 is not None and nick_elem2.text:
+                participant_data["display_name"] = nick_elem2.text
+
         # Extract stats-id from Jitsi extension
         stats_elem = presence.xml.find('{http://jitsi.org/jitmeet}stats-id')
         if stats_elem is not None and stats_elem.text:
@@ -940,92 +798,6 @@ class XMPPBot(ClientXMPP):
         """
         conference_muc = f"{room}@muc.{self.settings.domain}"
         return self.conference_participants.get(conference_muc, {})
-
-    async def allocate_forwarder_for_participant(self, room: str, participant_jid: str) -> bool:
-        """
-        Allocate Colibri forwarder for a specific participant in a room (Phase 1.3).
-        Updates participant dict with forwarder info.
-        
-        Returns True if successful, False otherwise.
-        """
-        if room not in self.conference_participants:
-            self.logger(f"⚠️ Cannot allocate forwarder: room {room} not in tracked conferences")
-            return False
-            
-        if participant_jid not in self.conference_participants[room]:
-            self.logger(f"⚠️ Cannot allocate forwarder: participant {participant_jid} not in room {room}")
-            return False
-            
-        participant = self.conference_participants[room][participant_jid]
-        
-        # Extract endpoint ID (resource part of JID)
-        endpoint_id = participant_jid.split('/')[-1] if '/' in participant_jid else participant_jid
-        
-        try:
-            import time
-            
-            # Wait for Bridge Session ID to be discovered
-            # This handles the race condition where Jingle offer processing (which extracts the ID)
-            # happens concurrently with this allocation call.
-            for i in range(25): # Wait up to 5 seconds
-                if room in self.conference_ids:
-                    break
-                self.logger(f"⏳ Waiting for Bridge Session ID for {room} (Attempt {i+1}/25)...")
-                await asyncio.sleep(0.2)
-            
-            # Use the correct Colibri conference ID if available, otherwise fallback to room name
-            conference_id = self.conference_ids.get(room, room)
-            if conference_id != room:
-                self.logger(f"Using Bridge Session ID {conference_id} for allocation (instead of {room})")
-            else:
-                self.logger(f"⚠️ Bridge Session ID not found for {room}, falling back to MUC name")
-            
-            allocation = await self.allocate_forwarder(conference_id, endpoint_id)
-            forwarder_info = allocation.get('forwarder', {})
-            
-            # Store forwarder details in participant
-            participant['forwarder'] = {
-                'ip': forwarder_info.get('ip'),
-                'port': forwarder_info.get('port'),
-                'allocated_at': time.time(),
-                'endpoint_id': endpoint_id
-            }
-            
-            self.logger(f"✅ Allocated forwarder for {participant.get('nick', participant_jid)}: "
-                       f"{forwarder_info.get('ip')}:{forwarder_info.get('port')}")
-            return True
-            
-        except Exception as e:
-            self.logger(f"❌ Failed to allocate forwarder for {participant_jid}: {e}")
-            import traceback
-            self.logger(f"Traceback: {traceback.format_exc()}")
-            return False
-
-    def get_participants_with_forwarders(self, room: str) -> List[Dict[str, Any]]:
-        """
-        Get all participants in room who have forwarders allocated (Phase 1.3).
-        Returns list suitable for FFmpeg command building.
-        """
-        if room not in self.conference_participants:
-            return []
-            
-        result = []
-        for jid, participant in self.conference_participants[room].items():
-            if 'forwarder' in participant and 'ssrcs' in participant:
-                # Has both SSRC and forwarder - ready for recording
-                fwd = participant['forwarder']
-                ssrc_audio = participant['ssrcs'].get('audio', {})
-                
-                result.append({
-                    'id': fwd.get('endpoint_id', jid.split('/')[-1]),
-                    'name': participant.get('nick', ''),
-                    'jid': jid,
-                    'rtp_url': f"rtp://{fwd['ip']}:{fwd['port']}",
-                    'ssrc': ssrc_audio.get('ssrc'),
-                    'forwarder': fwd
-                })
-        
-        return result
 
     def is_in_conference(self, room: str) -> bool:
         """
@@ -1113,107 +885,6 @@ class XMPPBot(ClientXMPP):
         self._track_participant_leave(room, participant_nick)
 
 
-    async def allocate_colibri_v1(self, conference_id: str, endpoint_id: str) -> Dict[str, Any]:
-        """
-        Allocates an audio channel using the legacy Colibri v1 protocol.
-        Namespace: http://jitsi.org/protocol/colibri
-        """
-        from slixmpp.exceptions import IqError, IqTimeout
-
-        if not self.bridge_jid:
-            raise RuntimeError("Bridge JID not discovered")
-
-        self.logger(f"📡 Allocating Colibri v1 Channel on {self.bridge_jid}...")
-
-        # 1. Construct the IQ
-        iq = self.make_iq_set(ito=self.bridge_jid)
-
-        # <conference xmlns='http://jitsi.org/protocol/colibri' id='...'>
-        # Note: If conference_id is None/Empty, JVB creates a new one.
-        conference = ET.Element('{http://jitsi.org/protocol/colibri}conference')
-        if conference_id:
-            conference.set('id', conference_id)
-
-        # <content name='audio'>
-        content = ET.Element('{http://jitsi.org/protocol/colibri}content')
-        content.set('name', 'audio')
-
-        # <channel initiator='true' expire='60'>
-        # 'initiator=true' asks JVB to start the ICE connectivity checks
-        channel = ET.Element('{http://jitsi.org/protocol/colibri}channel')
-        channel.set('initiator', 'true')
-        channel.set('expire', '180')  # 3 minutes expiry (refresh with simple IQs)
-
-        # <payload-type .../> (Standard Opus)
-        payload = ET.Element('{http://jitsi.org/protocol/colibri}payload-type')
-        payload.set('id', '111')
-        payload.set('name', 'opus')
-        payload.set('clockrate', '48000')
-        payload.set('channels', '2')
-
-        # <transport xmlns='urn:xmpp:jingle:transports:ice-udp:1'/>
-        # We send an empty transport to tell JVB "Allocate ICE candidates for me"
-        transport = ET.Element('{urn:xmpp:jingle:transports:ice-udp:1}transport')
-
-        # Assemble structure
-        channel.append(payload)
-        channel.append(transport)
-        content.append(channel)
-        conference.append(content)
-        iq.append(conference)
-
-        try:
-            # 2. Send and Await Reply
-            result = await iq.send(timeout=10)
-            self.logger("✅ Colibri v1 Allocation Success!")
-
-            # 3. Parse Response (Extract JVB's ICE Candidates)
-            # The response mirrors the request but fills in 'id', 'ufrag', 'pwd', and 'candidates'
-            resp_conf = result.find('{http://jitsi.org/protocol/colibri}conference')
-            resp_content = resp_conf.find('{http://jitsi.org/protocol/colibri}content')
-            resp_channel = resp_content.find('{http://jitsi.org/protocol/colibri}channel')
-            resp_transport = resp_channel.find('{urn:xmpp:jingle:transports:ice-udp:1}transport')
-
-            allocation_data = {
-                "conference_id": resp_conf.get('id'),
-                "channel_id": resp_channel.get('id'),
-                "ufrag": resp_transport.get('ufrag') if resp_transport is not None else None,
-                "pwd": resp_transport.get('pwd') if resp_transport is not None else None,
-                "candidates": []
-            }
-
-            if resp_transport is not None:
-                for cand in resp_transport.findall('{urn:xmpp:jingle:transports:ice-udp:1}candidate'):
-                    allocation_data["candidates"].append({
-                        "ip": cand.get('ip'),
-                        "port": cand.get('port'),
-                        "proto": cand.get('protocol'),
-                        "type": cand.get('type'),
-                        "foundation": cand.get('foundation'),
-                        "component": cand.get('component'),
-                        "priority": cand.get('priority')
-                    })
-
-            self.logger(f"📦 JVB Candidates: {len(allocation_data['candidates'])} found")
-            self.logger(f"📦 Conference ID: {allocation_data['conference_id']}")
-            self.logger(f"📦 Channel ID: {allocation_data['channel_id']}")
-
-            return allocation_data
-
-        except IqError as e:
-            error_condition = e.iq['error']['condition']
-            self.logger(f"❌ JVB rejected allocation: {error_condition}")
-            self.logger(f"Full error IQ: {e.iq}")
-            raise
-        except IqTimeout:
-            self.logger("❌ JVB allocation timed out")
-            raise
-        except Exception as e:
-            self.logger(f"❌ Unexpected error during Colibri v1 allocation: {e}")
-            import traceback
-            self.logger(f"Traceback: {traceback.format_exc()}")
-            raise
-
     async def run(self):
         """
         Main async method to connect and run until disconnected.
@@ -1249,56 +920,6 @@ class XMPPBot(ClientXMPP):
 
         # Run until disconnected
         await self.disconnected
-
-    async def allocate_forwarder(self, conference_id: str, endpoint_id: str) -> Dict[str, Any]:
-        """
-        Allocate a forwarder using Colibri v1 (legacy protocol).
-        Colibri2 is not supported by this JVB version.
-        """
-        self.logger(f"Allocating forwarder for conference={conference_id}, endpoint={endpoint_id}")
-
-        try:
-            # Use Colibri v1 allocation
-            allocation_data = await self.allocate_colibri_v1(conference_id, endpoint_id)
-
-            # Return response in compatible format
-            return {
-                "id": allocation_data["channel_id"],
-                "conference_id": allocation_data["conference_id"],
-                "bridge_jid": self.bridge_jid,
-                "ufrag": allocation_data["ufrag"],
-                "pwd": allocation_data["pwd"],
-                "candidates": allocation_data["candidates"],
-                "forwarder": {
-                    # For now, we'll extract the first candidate if available
-                    "ip": allocation_data["candidates"][0]["ip"] if allocation_data["candidates"] else None,
-                    "port": allocation_data["candidates"][0]["port"] if allocation_data["candidates"] else None,
-                }
-            }
-        except Exception as e:
-            self.logger(f"Failed to allocate forwarder: {e}")
-            raise
-
-    async def release_forwarder(self, conference_id: str, endpoint_id: str) -> None:
-        """Release an endpoint from JVB."""
-        if not self.bridge_jid:
-            self.logger("No bridge JID available for release")
-            return
-        try:
-            iq = Colibri2IQ.build_release(conference_id, endpoint_id)
-            iq.attrib["to"] = self.bridge_jid
-            await self._send_iq_async(iq)
-            self.logger(f"Released endpoint {endpoint_id} from conference {conference_id}")
-        except Exception as e:
-            self.logger(f"Failed to release endpoint: {e}")
-
-    async def _send_iq_async(self, iq_elem: ET.Element) -> ET.Element:
-        future = self.Iq()
-        future.append(iq_elem[0])
-        future["to"] = iq_elem.attrib.get("to")
-        future["type"] = "set"
-        resp = await future.send()
-        return resp.xml
 
     def _resolve_conference_id_via_debug(self, room_name: str) -> Optional[str]:
         """
@@ -1353,7 +974,7 @@ class XMPPBot(ClientXMPP):
             self.logger(f"❌ Error resolving via debug: {e}")
             return None
 
-    async def start_multitrack_recording(self, room_name: str) -> bool:
+    async def start_multitrack_recording(self, room_name: str, record_video: bool | None = None) -> bool:
         """
         Start multitrack recording via JVB REST API.
         """
@@ -1392,20 +1013,24 @@ class XMPPBot(ClientXMPP):
             
         self.logger(f"✅ Using conference ID: {conference_id}")
         
-        # Construct recorder WebSocket URL with room parameter
-        recorder_url = f"{self.recorder_ws_url}?room={room_short}"
+        # Construct recorder WebSocket URL with path parameter
+        # Official recorder expects: /record/{meetingId}
+        recorder_url = f"{self.recorder_ws_url}/{conference_id}"
         
+        # Note: JVB 2.3.x does NOT support video recording via connects.
+        # "Unsupported request (Video)" is returned if video=true.
         payload = {
             "connects": [
                 {
                     "url": recorder_url,
                     "protocol": "mediajson",
-                "type": "recorder",
-                "audio": True,
+                    "type": "recorder",
+                    "audio": True,
                     "video": False
                 }
             ]
         }
+        self.logger(f"📦 PATCH payload: {json.dumps(payload)}")
         
         url = f"{self.jvb_rest_url}/colibri/v2/conferences/{conference_id}"
         
@@ -1503,6 +1128,334 @@ class XMPPBot(ClientXMPP):
             self.logger(f"❌ Error stopping recording: {e}")
             return False
 
+    # ========================================================================
+    # Auto-recording monitor
+    # ========================================================================
+
+    def get_active_conferences_from_debug(self) -> list[dict[str, Any]]:
+        """Fetch active conferences from JVB debug endpoint. Returns list of conference dicts."""
+        try:
+            resp = requests.get(f"{self.jvb_rest_url}/debug", timeout=5)
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+
+            # JVB debug returns different structures depending on version/endpoint.
+            # Try /colibri/v2/conferences for richer data, fall back to /debug
+            conferences_raw = data.get("conferences", data.get("conference", {}))
+            if isinstance(conferences_raw, list):
+                conferences_raw = {c.get("id", str(i)): c for i, c in enumerate(conferences_raw)}
+            elif isinstance(conferences_raw, dict) and not conferences_raw:
+                # Empty from /debug — try /colibri/v2/conferences for conference list
+                try:
+                    r2 = requests.get(f"{self.jvb_rest_url}/colibri/v2/conferences", timeout=3)
+                    if r2.status_code == 200:
+                        c2 = r2.json()
+                        if isinstance(c2, list):
+                            conferences_raw = {c.get("id", str(i)): c for i, c in enumerate(c2)}
+                        elif isinstance(c2, dict):
+                            conferences_raw = c2
+                except Exception:
+                    pass
+
+            result = []
+            for conf_id, conf_data in conferences_raw.items():
+                if not isinstance(conf_data, dict):
+                    continue
+                name = conf_data.get("name", "")
+                meeting_id = conf_data.get("meeting_id") or conf_data.get("id") or conf_id
+
+                # Extract endpoints — may be dict or list depending on JVB version
+                eps_raw = conf_data.get("endpoints", {})
+                if isinstance(eps_raw, dict):
+                    endpoints = eps_raw
+                elif isinstance(eps_raw, list):
+                    endpoints = {e.get("id", str(i)): e for i, e in enumerate(eps_raw)}
+                else:
+                    endpoints = {}
+
+                # If no endpoint details, estimate count from top-level stats
+                ep_count = len(endpoints)
+                if ep_count == 0:
+                    ep_count = conf_data.get("endpoint_count", 0)
+
+                result.append({
+                    "name": name,
+                    "meeting_id": meeting_id,
+                    "endpoint_count": ep_count if ep_count > 0 else len(endpoints),
+                    "endpoints": endpoints,
+                })
+            return result
+        except Exception as e:
+            self.logger(f"[AUTO-REC] Error polling JVB debug: {e}")
+            return []
+
+    async def start_auto_recording_monitor(self):
+        """Start the background polling loop for auto-recording."""
+        if self._auto_recording_task and not self._auto_recording_task.done():
+            self.logger("[AUTO-REC] Monitor already running")
+            return
+        self.logger(f"[AUTO-REC] Starting monitor (poll={self.poll_interval}s, min_participants={self.min_participants}, video={self.record_video})")
+        self._auto_recording_task = asyncio.create_task(self._auto_recording_loop())
+
+    async def stop_auto_recording_monitor(self):
+        """Stop the background polling loop."""
+        if self._auto_recording_task and not self._auto_recording_task.done():
+            self._auto_recording_task.cancel()
+            try:
+                await self._auto_recording_task
+            except asyncio.CancelledError:
+                pass
+        self.logger("[AUTO-REC] Monitor stopped")
+
+    async def _auto_recording_loop(self):
+        """Poll JVB for active conferences and auto-start/stop recording."""
+        self.logger("[AUTO-REC] Polling loop started")
+        while True:
+            try:
+                await self._auto_recording_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger(f"[AUTO-REC] Tick error: {e}")
+                import traceback
+                self.logger(f"[AUTO-REC] {traceback.format_exc()}")
+            await asyncio.sleep(self.poll_interval)
+
+    async def _auto_recording_tick(self):
+        conferences = self.get_active_conferences_from_debug()
+        active_meeting_ids = set()
+
+        for conf in conferences:
+            meeting_id = conf["meeting_id"]
+            room_name = conf["name"]  # full MUC JID e.g. testroom@muc.meet.jitsi
+            room_short = room_name.split("@")[0] if "@" in room_name else room_name
+            ep_count = conf["endpoint_count"]
+            active_meeting_ids.add(meeting_id)
+
+            # Skip if already recording
+            if meeting_id in self.auto_recordings:
+                # Update endpoint snapshot for metadata
+                self.auto_recordings[meeting_id]["endpoints"] = conf["endpoints"]
+                continue
+
+            # Skip if not enough participants
+            if ep_count < self.min_participants:
+                continue
+
+            self.logger(f"[AUTO-REC] New conference detected: {room_short} ({meeting_id}) with {ep_count} endpoints")
+
+            # Cache conference ID mapping
+            self.conference_ids[room_short] = meeting_id
+            if room_name:
+                self.conference_ids[room_name] = meeting_id
+
+            # Join MUC to track participants
+            full_room_jid = room_name if "@" in room_name else f"{room_name}@muc.{self.settings.domain}"
+            if not self.is_in_conference(full_room_jid):
+                try:
+                    await self.join_conference_muc(room_short)
+                    await asyncio.sleep(2)  # Let presence stanzas arrive
+                except Exception as e:
+                    self.logger(f"[AUTO-REC] Failed to join MUC {room_short}: {e}")
+
+            # Snapshot current participants (MUC nick = endpoint ID)
+            participant_snapshot = {}
+            if full_room_jid in self.conference_participants:
+                for nick, pdata in self.conference_participants[full_room_jid].items():
+                    if nick in ("recorder-bot", "focus"):
+                        continue
+                    participant_snapshot[nick] = dict(pdata)
+
+            # Start recording
+            success = await self.start_multitrack_recording(room_short)
+            if success:
+                self.auto_recordings[meeting_id] = {
+                    "room_name": room_name,
+                    "room_short": room_short,
+                    "meeting_id": meeting_id,
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                    "endpoints": conf["endpoints"],
+                    "participants_snapshot": participant_snapshot,
+                }
+                self.logger(f"[AUTO-REC] Recording started for {room_short} (participants: {list(participant_snapshot.keys())})")
+            else:
+                self.logger(f"[AUTO-REC] Failed to start recording for {room_short}")
+            continue
+
+        # For already-recording conferences, accumulate participant snapshots
+        for meeting_id, rec in self.auto_recordings.items():
+            room_name = rec["room_name"]
+            full_jid = room_name if "@" in room_name else f"{room_name}@muc.{self.settings.domain}"
+            if full_jid in self.conference_participants:
+                snapshot = rec.setdefault("participants_snapshot", {})
+                for nick, pdata in self.conference_participants[full_jid].items():
+                    if nick in ("recorder-bot", "focus"):
+                        continue
+                    # Accumulate — don't overwrite, so we keep participants who left
+                    if nick not in snapshot:
+                        snapshot[nick] = dict(pdata)
+
+        # Detect ended conferences and finalize
+        ended = [mid for mid in self.auto_recordings if mid not in active_meeting_ids]
+        for meeting_id in ended:
+            rec = self.auto_recordings.pop(meeting_id)
+            self.logger(f"[AUTO-REC] Conference ended: {rec['room_short']} ({meeting_id})")
+
+            # Stop recording (may 404 if conference already gone, that's fine)
+            try:
+                await self.stop_multitrack_recording(rec["room_short"])
+            except Exception:
+                pass
+
+            # Write metadata
+            self._write_recording_metadata(rec)
+
+    def _rename_mka_tracks(self, rec_dir: Path, snapshot: dict[str, dict]):
+        """Rename MKA track titles from 'endpoint_id-ssrc' to 'endpoint_id - display_name'.
+
+        Uses ffprobe to read existing track titles, maps endpoint IDs to display
+        names from the participant snapshot, then remuxes with ffmpeg.
+        """
+        mka_files = list(rec_dir.glob("*.mka"))
+        if not mka_files:
+            self.logger(f"[AUTO-REC] No MKA file found in {rec_dir}, skipping track rename")
+            return
+
+        mka_path = mka_files[0]
+        try:
+            # Probe streams to get current track titles
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", str(mka_path)],
+                capture_output=True, text=True, timeout=10
+            )
+            if probe.returncode != 0:
+                self.logger(f"[AUTO-REC] ffprobe failed: {probe.stderr}")
+                return
+
+            streams = json.loads(probe.stdout).get("streams", [])
+            if not streams:
+                self.logger("[AUTO-REC] No streams found in MKA")
+                return
+
+            # Build endpoint_id -> display_name map from snapshot
+            ep_to_name: dict[str, str] = {}
+            for endpoint_id, pdata in snapshot.items():
+                display = pdata.get("display_name") or endpoint_id
+                ep_to_name[endpoint_id] = display
+
+            # Build ffmpeg metadata args: map each stream title
+            metadata_args: list[str] = []
+            for idx, stream in enumerate(streams):
+                title = stream.get("tags", {}).get("title", "")
+                # Title format from recorder: "endpoint_id-ssrc_number"
+                ep_id = title.split("-")[0] if "-" in title else title
+                if ep_id in ep_to_name:
+                    new_title = f"{ep_id} - {ep_to_name[ep_id]}"
+                else:
+                    new_title = title  # keep original if no match
+                metadata_args += [f"-metadata:s:{idx}", f"title={new_title}"]
+
+            if not metadata_args:
+                return
+
+            # Remux with new metadata (copy all codecs)
+            tmp_path = mka_path.with_suffix(".tmp.mka")
+            cmd = ["ffmpeg", "-y", "-i", str(mka_path), "-c", "copy"] + metadata_args + [str(tmp_path)]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if result.returncode != 0:
+                self.logger(f"[AUTO-REC] ffmpeg remux failed: {result.stderr[:300]}")
+                if tmp_path.exists():
+                    tmp_path.unlink()
+                return
+
+            # Replace original with remuxed file
+            tmp_path.replace(mka_path)
+            self.logger(f"[AUTO-REC] Renamed {len(streams)} MKA tracks with participant names")
+
+        except Exception as e:
+            self.logger(f"[AUTO-REC] Track rename error: {e}")
+
+    def _write_recording_metadata(self, rec: dict[str, Any]):
+        """Write metadata.json alongside the recording MKA file.
+
+        MUC nick = JVB endpoint ID, so participants_snapshot keys are endpoint IDs
+        that directly correspond to MKA track tags.
+        """
+        meeting_id = rec["meeting_id"]
+        room_short = rec["room_short"]
+
+        # Use accumulated snapshot (nick = endpoint_id -> participant data)
+        snapshot = rec.get("participants_snapshot", {})
+
+        # Build participants dict keyed by "endpoint_id - display_name" for readability
+        participants = {}
+        for endpoint_id, pdata in snapshot.items():
+            display_name = pdata.get("display_name") or endpoint_id
+            channel_name = f"{endpoint_id} - {display_name}"
+            participants[channel_name] = {
+                "endpoint_id": endpoint_id,
+                "display_name": display_name,
+                "stats_id": pdata.get("stats_id", ""),
+                "jid": pdata.get("jid", ""),
+                "joined_at": pdata.get("joined_at", ""),
+            }
+
+        metadata = {
+            "meeting_id": meeting_id,
+            "room": room_short,
+            "started_at": rec.get("started_at"),
+            "ended_at": datetime.now(timezone.utc).isoformat(),
+            "record_video": self.record_video,
+            "participants": participants,
+        }
+
+        # Find the recording directory — recorder writes to /data/{meetingId}/
+        # The meeting_id from debug may differ from the one the recorder uses,
+        # so search for any directory containing an MKA created during this session.
+        rec_dir = Path(self.recordings_dir) / meeting_id
+        if not rec_dir.exists():
+            parent = Path(self.recordings_dir)
+            if parent.exists():
+                # Search by meeting_id substring match first
+                matches = [d for d in parent.iterdir() if d.is_dir() and meeting_id in d.name]
+                if not matches:
+                    # Fallback: find most recently created dir with an MKA file
+                    matches = sorted(
+                        [d for d in parent.iterdir() if d.is_dir() and list(d.glob("*.mka"))],
+                        key=lambda d: d.stat().st_mtime, reverse=True
+                    )
+                if matches:
+                    rec_dir = matches[0]
+                else:
+                    rec_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write metadata
+        meta_path = rec_dir / "metadata.json"
+        try:
+            meta_path.write_text(json.dumps(metadata, indent=2))
+            self.logger(f"[AUTO-REC] Wrote metadata to {meta_path}")
+        except Exception as e:
+            self.logger(f"[AUTO-REC] Failed to write metadata: {e}")
+
+        # Post-process MKA: rename tracks to "endpoint_id - display_name"
+        self._rename_mka_tracks(rec_dir, snapshot)
+
+        # Rename directory to {yymmdd_hhmmss}_{room}_{meetingId}
+        try:
+            started = rec.get("started_at", "")
+            if started:
+                ts = datetime.fromisoformat(started).strftime("%y%m%d_%H%M%S")
+            else:
+                ts = datetime.now(timezone.utc).strftime("%y%m%d_%H%M%S")
+            new_name = f"{ts}_{room_short}_{meeting_id}"
+            new_dir = rec_dir.parent / new_name
+            if not new_dir.exists():
+                rec_dir.rename(new_dir)
+                self.logger(f"[AUTO-REC] Renamed recording dir to {new_name}")
+        except Exception as e:
+            self.logger(f"[AUTO-REC] Failed to rename recording dir: {e}")
+
 
 def create_xmpp_bot_from_env(logger: Optional[Callable[[str], None]] = None) -> XMPPBot:
     settings = load_xmpp_settings()
@@ -1568,52 +1521,3 @@ class ComponentBot(ComponentXMPP):
             self.bridge_jid = occupant.bare
             self.logger(f"Discovered bridge JID: {self.bridge_jid}")
 
-    async def allocate_forwarder(self, conference_id: str, endpoint_id: str) -> Dict[str, Any]:
-        """
-        Allocate a forwarder using Colibri v1 (legacy protocol).
-        Colibri2 is not supported by this JVB version.
-        """
-        self.logger(f"Allocating forwarder for conference={conference_id}, endpoint={endpoint_id}")
-
-        try:
-            # Use Colibri v1 allocation
-            allocation_data = await self.allocate_colibri_v1(conference_id, endpoint_id)
-
-            # Return response in compatible format
-            return {
-                "id": allocation_data["channel_id"],
-                "conference_id": allocation_data["conference_id"],
-                "bridge_jid": self.bridge_jid,
-                "ufrag": allocation_data["ufrag"],
-                "pwd": allocation_data["pwd"],
-                "candidates": allocation_data["candidates"],
-                "forwarder": {
-                    # For now, we'll extract the first candidate if available
-                    "ip": allocation_data["candidates"][0]["ip"] if allocation_data["candidates"] else None,
-                    "port": allocation_data["candidates"][0]["port"] if allocation_data["candidates"] else None,
-                }
-            }
-        except Exception as e:
-            self.logger(f"Failed to allocate forwarder: {e}")
-            raise
-
-    async def release_forwarder(self, conference_id: str, endpoint_id: str) -> None:
-        """Release an endpoint from JVB."""
-        if not self.bridge_jid:
-            self.logger("No bridge JID available for release")
-            return
-        try:
-            iq = Colibri2IQ.build_release(conference_id, endpoint_id)
-            iq.attrib["to"] = self.bridge_jid
-            await self._send_iq_async(iq)
-            self.logger(f"Released endpoint {endpoint_id} from conference {conference_id}")
-        except Exception as e:
-            self.logger(f"Failed to release endpoint: {e}")
-
-    async def _send_iq_async(self, iq_elem: ET.Element) -> ET.Element:
-        future = self.Iq()
-        future.append(iq_elem[0])
-        future["to"] = iq_elem.attrib.get("to")
-        future["type"] = "set"
-        resp = await future.send()
-        return resp.xml

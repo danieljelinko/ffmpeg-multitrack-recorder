@@ -518,7 +518,7 @@ services:
         ports:
             - '8989:8989'
         volumes:
-            - ./recordings:/recordings:Z
+            - ./recordings:/data:Z
             - ./scripts/finalize-recording.sh:/scripts/finalize-recording.sh:ro
         environment:
             - RECORDING_DIR=/recordings

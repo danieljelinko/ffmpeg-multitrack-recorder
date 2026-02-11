@@ -32,7 +32,7 @@ alwaysApply: true
 ## Imports
 
 - Keep general module imports on a single line as shown above.
-- When working with constants modules (e.g. `guess_class_libs.entities.common_keys`), prefer `from ...common_keys import *` so lookups like `cfg[DB_STR]` stay concise.
+- When working with constants modules (e.g. `tag.core.entities.common_keys`), prefer `from ...common_keys import *` so lookups like `cfg[DB_STR]` stay concise.
 
 ## Code style
 
@@ -40,11 +40,11 @@ alwaysApply: true
 - Example:
      ```python
     def print_var(var1: str # extra not obvious information about the variable that is not obvious from the variable name
-        ) -> None: 
+        ) -> None:
     """ Additional info about the function logic, parameters, return value, etc. that is not obvious from the function name or parameters. """
     print(var1)
     ```
-    
+
 - Use backticks for parameter names in docstrings.
 - Reference equation numbers when implementing from papers.
 - Use type hints for all functions.
@@ -65,7 +65,7 @@ alwaysApply: true
 - **Code Reuse Analysis**: Before implementing, check if similar functionality exists
 
 ### No Magic Strings => centralized const definitions
-- **Constants File**: Import keys from `guess_class_libs.entities.common_keys` (or add a `{module}_common_keys.py` alongside the code you are authoring) so `config[BATCH_SIZE]` replaces `config['batch_size']`. Define new constants there before using them.
+- **Constants File**: Import keys from `tag.core.entities.common_keys` (or add a `{module}_common_keys.py` alongside the code you are authoring) so `config[BATCH_SIZE]` replaces `config['batch_size']`. Define new constants there before using them.
 
 
 ### Performance

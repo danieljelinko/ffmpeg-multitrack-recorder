@@ -26,6 +26,15 @@ services:
       - XMPP_DOMAIN
       - JVB_BRIDGE_MUC
       - COLIBRI2_SIMULATE
+      # JVB REST API for multitrack recording
+      - JVB_REST_URL
+      - RECORDER_WS_URL
+      # Auto-recording
+      - ENABLE_AUTO_RECORDING
+      - RECORD_VIDEO
+      - MIN_PARTICIPANTS
+      - POLL_INTERVAL
+      - RECORDINGS_DIR
     volumes:
       - ./controller:/app
       - ${RECORDINGS_PATH:-./recordings}:/recordings:Z

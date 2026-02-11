@@ -40,13 +40,13 @@ Rules are distributed via the `sync-ruler-rules.sh` automation script which:
 
 The automation is triggered manually but agents can request rule updates by asking to:
 1. Run the `sync-ruler-rules.sh` script
-2. Execute `ruler apply` in specific repositories  
+2. Execute `ruler apply` in specific repositories
 3. Verify rule distribution and functionality
 
 ## Repository Types
 
 - **Universal Rules**: Applied to all repositories (coding style, package management, ruler docs)
 - **UI Projects**: Get additional FastHTML/HTMX/MonsterUI rules
-- **Notebook Projects**: Get nbdev structure rules (except guess-class-core which has special nbdev rules)
+- **Notebook Projects**: Get nbdev structure rules (except tag-core which has special nbdev rules)
 
 This system ensures consistent coding standards and AI assistant behavior across the entire guess-class ecosystem.
