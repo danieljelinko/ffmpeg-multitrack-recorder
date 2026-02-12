@@ -1,38 +1,46 @@
-# Jitsi Multitrack Audio Recorder
+# Jitsi Multitrack Recorder
 
-Server-side multitrack recording for Jitsi Meet. Captures each participant's audio as a separate Opus track in a single MKA (Matroska Audio) file, with automatic participant metadata and human-readable track naming.
+Server-side multitrack recording for Jitsi Meet. Captures each participant's audio as a separate Opus track in a single MKA (Matroska Audio) file, with optional composite video recording via headless browser.
 
 ## Features
 
 - **Per-participant audio tracks** --- each speaker gets their own Opus track in one MKA file
+- **Composite video recording** --- optional full-meeting video capture via headless Chromium (Playwright)
 - **Auto-recording** --- automatically starts recording when participants join, stops when the conference ends
 - **Participant metadata** --- `metadata.json` with display names, endpoint IDs, timestamps
 - **Track renaming** --- MKA track titles rewritten from `endpoint_id-ssrc` to `endpoint_id - DisplayName`
 - **Directory naming** --- recordings stored as `{yymmdd_hhmmss}_{room}_{meetingId}/`
 - **Manual API** --- start/stop recording via REST endpoints
-- **No browser automation** --- bypasses Jibri/Selenium entirely using JVB REST API
+- **No Jibri required** --- audio via JVB REST API, video via lightweight headless browser
 
 ## Architecture
 
 ```
 Browsers  --->  [Jitsi Meet Web]  --->  [Prosody]  --->  [Jicofo]
-                                                             |
-                                                           [JVB]
-                                                          /     \
-                                                   UDP/ICE    WebSocket
-                                                    /            \
-                                              Browsers    [Multitrack Recorder]
-                                                                  |
-                                                          recordings/*.mka
+                                    ^                        |
+                                    |                      [JVB]
+                                    |                     /     \
+                                    |              UDP/ICE    WebSocket (MediaJSON)
+                                    |               /            \
+                                    |         Browsers    [Multitrack Recorder]
+                                    |                            |
+                                    |                    recordings/*.mka (audio)
+                              [Video Recorder]
+                           (headless Chromium)
+                                    |
+                            recordings/*.webm (video)
 
 [Controller] --- XMPP bot + FastAPI ---
   - Polls JVB /debug to discover conferences
-  - PATCH /colibri/v2/conferences/{id} to start/stop recording
+  - PATCH /colibri/v2/conferences/{id} to start/stop audio recording
+  - HTTP calls to video-recorder to start/stop video recording
   - Joins conference MUCs to track participant names
   - Writes metadata.json and renames MKA tracks
 ```
 
-**Data flow**: The controller instructs JVB (via REST API) to open a WebSocket connection to the `jitsi/jitsi-multitrack-recorder` container. JVB streams MediaJSON-encoded audio over this WebSocket. The recorder writes a single MKA file with one track per participant.
+**Audio data flow**: The controller instructs JVB (via REST API) to open a WebSocket connection to the `jitsi/jitsi-multitrack-recorder` container. JVB streams MediaJSON-encoded audio over this WebSocket. The recorder writes a single MKA file with one track per participant.
+
+**Video data flow** (when `RECORD_VIDEO=true`): The controller tells the video-recorder service to launch a headless Chromium browser that joins the Jitsi meeting. Playwright captures the rendered page (composite view of all participants) as a WebM video file.
 
 ## Prerequisites
 
@@ -63,10 +71,14 @@ XMPP_PORT=5222
 ### 2. Start the Jitsi stack + recorder
 
 ```bash
+# Audio-only (default)
 docker compose up -d
+
+# With video recording (adds headless browser service)
+docker compose --profile video up -d
 ```
 
-This starts: web, prosody, jicofo, jvb, and the multitrack recorder.
+This starts: web, prosody, jicofo, jvb, multitrack recorder, and optionally the video recorder.
 
 ### 3. Start the controller
 
@@ -117,9 +129,13 @@ curl -X POST http://localhost:8288/api/record/stop \
 | `ENABLE_AUTO_RECORDING` | `1` | Auto-start recording when participants join |
 | `MIN_PARTICIPANTS` | `2` | Minimum endpoints before auto-recording triggers |
 | `POLL_INTERVAL` | `5` | Seconds between JVB debug endpoint polls |
-| `RECORD_VIDEO` | `false` | Video recording (not supported on JVB 2.3.x) |
+| `RECORD_VIDEO` | `false` | Enable composite video recording via headless browser |
+| `VIDEO_RECORDER_URL` | `http://video-recorder:3000` | Video recorder service URL |
 | `RECORDER_API_SECRET` | (required) | Auth token for controller REST API |
 | `RECORDINGS_DIR` | `/recordings` | Recording output path inside controller container |
+| `RECORDER_DISPLAY_NAME` | `Recorder` | Display name for the recorder participant in meetings |
+| `RECORDER_AVATAR_URL` | (empty) | URL to avatar image shown in the recorder's participant tile |
+| `RECORDER_VIDEO_FEED` | (empty) | Path to Y4M file for fake video capture (must be mounted into container) |
 
 ### XMPP bot settings
 
@@ -147,6 +163,7 @@ curl -X POST http://localhost:8288/api/record/stop \
 recordings/
   260211_072841_testroom_5e27da12-.../
     recording.mka          # Matroska Audio: one Opus track per participant
+    video.webm             # Composite video (only when RECORD_VIDEO=true)
     metadata.json          # Participant names, timestamps, meeting info
 ```
 
@@ -185,6 +202,19 @@ Each track in the MKA file is titled `endpoint_id - DisplayName` (e.g., `a9c5e6e
 ```bash
 ffprobe -v quiet -print_format json -show_streams recording.mka
 ```
+
+### Merging audio + video
+
+Audio and video recordings have slightly different start times (~7-15 seconds offset) because the audio starts via JVB API (instant) while video requires a headless browser to join the meeting (slow). The `metadata.json` records both `started_at` (audio) and `video_started_at` timestamps.
+
+Use the merge script to combine them with proper alignment:
+
+```bash
+# Produces merged.mkv (video + all audio tracks) and merged-mixdown.mp4 (video + mixed audio)
+./scripts/merge-av.sh recordings/260211_072841_testroom_5e27.../
+```
+
+The script reads the timestamps from `metadata.json`, computes the offset, and uses ffmpeg's `-itsoffset` to align them.
 
 ## API Reference
 
@@ -255,7 +285,8 @@ Display names come from XMPP presence. Participants must set a display name in t
 
 ## Known Limitations
 
-- **Audio only** --- JVB 2.3.x does not support video in the multitrack connects API. `video: true` returns "Unsupported request (Video)".
+- **Audio multitrack, video composite** --- Per-participant audio tracks are captured via JVB connects API. Video is composite only (captured via headless browser), not per-participant, because JVB 2.3.x does not support video in the connects API.
 - **P2P must be disabled** --- 2-person calls bypass JVB by default, making recording impossible. This is enforced via `custom-config.js`.
-- **No Ogg/WAV export** --- Output is always MKA with Opus tracks. Use ffmpeg to convert individual tracks if needed.
+- **No Ogg/WAV export** --- Audio output is always MKA with Opus tracks. Use ffmpeg to convert individual tracks if needed.
+- **Video recorder resources** --- The headless Chromium browser uses ~300-500 MB RAM per active recording session. The recorder participant is visible to other users (customizable via `RECORDER_DISPLAY_NAME`, `RECORDER_AVATAR_URL`, and `RECORDER_VIDEO_FEED`).
 - **Single JVB** --- Designed for single-JVB deployments. Multi-JVB (Oocyte) would require routing the PATCH to the correct JVB instance.

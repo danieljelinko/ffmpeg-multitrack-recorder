@@ -35,6 +35,10 @@ services:
       - MIN_PARTICIPANTS
       - POLL_INTERVAL
       - RECORDINGS_DIR
+      # Video recorder service
+      - VIDEO_RECORDER_URL
+      # Recorder appearance
+      - RECORDER_DISPLAY_NAME
     volumes:
       - ./controller:/app
       - ${RECORDINGS_PATH:-./recordings}:/recordings:Z

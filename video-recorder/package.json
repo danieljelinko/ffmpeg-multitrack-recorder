@@ -1,0 +1,13 @@
+{
+  "name": "jitsi-video-recorder",
+  "version": "1.0.0",
+  "description": "Headless browser video recorder for Jitsi Meet conferences",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "playwright": "^1.40.0"
+  }
+}

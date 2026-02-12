@@ -510,7 +510,7 @@ services:
         networks:
             meet.jitsi:
 
-    # Multitrack Recorder
+    # Multitrack Recorder (audio)
     recorder:
         image: jitsi/jitsi-multitrack-recorder:latest
         container_name: jitsi_multitrack_recorder
@@ -527,6 +527,32 @@ services:
             - TZ=${TZ:-UTC}
         networks:
             meet.jitsi:
+
+    # Video Recorder (headless browser - composite video capture)
+    video-recorder:
+        build:
+            context: ./video-recorder
+            dockerfile: Dockerfile
+        container_name: jitsi_video_recorder
+        restart: unless-stopped
+        volumes:
+            - ./recordings:/recordings:Z
+            # Optional: mount a Y4M file for fake video feed
+            # - ./feed.y4m:/data/feed.y4m:ro
+        environment:
+            - JITSI_INTERNAL_URL=https://web:443
+            - RECORDINGS_DIR=/recordings
+            - PORT=3000
+            - TZ=${TZ:-UTC}
+            - RECORDER_DISPLAY_NAME=${RECORDER_DISPLAY_NAME:-Recorder}
+            - RECORDER_AVATAR_URL=${RECORDER_AVATAR_URL:-}
+            - RECORDER_VIDEO_FEED=${RECORDER_VIDEO_FEED:-}
+        depends_on:
+            - web
+        networks:
+            meet.jitsi:
+        profiles:
+            - video
 
 # Custom network so all services can communicate using a FQDN
 networks:

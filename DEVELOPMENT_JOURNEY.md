@@ -147,7 +147,7 @@ Display names come from XMPP presence stanzas in the conference MUC. The bot par
 
 ---
 
-## Video Recording Attempt (Feb 2026) --- BLOCKED
+## Video Recording Attempt via JVB Connects (Feb 2026) --- BLOCKED
 
 ### What we tried
 
@@ -157,10 +157,92 @@ Set `video: true` in the connects payload to capture video alongside audio.
 
 JVB 2.3.259 returns `"Unsupported request (Video)"` error. The multitrack recording connects API in this JVB version only supports audio.
 
-### Path forward
+### Root cause analysis
 
-- Upgrade to a newer JVB version that supports video in the connects API
-- Alternatively, use Jibri for video recording (composite single-stream) alongside multitrack audio
+The video restriction is **hard-coded** in JVB source, not a configuration flag:
+- `ExporterWrapper.kt` lines 37 & 71: `throw FeatureNotImplementedException("Video")`
+- `MediaJsonSerializer.kt` only handles `AudioRtpPacket` (OPUS codec)
+- Even the **latest JVB master branch** (as of Feb 2026) still has this restriction
+- No public Jitsi roadmap for video support in the connects API
+
+### Approaches evaluated
+
+| Approach | Feasibility | Notes |
+|----------|-------------|-------|
+| Patch JVB source | Very high complexity | Requires modifying 3+ Kotlin files, building custom JVB, AND modifying the recorder |
+| Newer JVB version | Not available | Latest master still blocks video |
+| Jibri (full) | Medium complexity | Heavy: Chrome + Xvfb + ffmpeg, composite only |
+| Headless browser (Playwright) | **Medium complexity** | Lightweight Jibri alternative, composite video |
+| aiortc per-participant | High complexity | Uses existing bot, but complex WebRTC negotiation |
+
+---
+
+## Phase E: Composite Video Recording via Headless Browser (Feb 2026) --- IMPLEMENTED
+
+### Approach
+
+Since per-participant video via JVB connects is not feasible, we implemented a **headless browser recorder** that captures **composite video** (what participants see) alongside the existing per-participant multitrack audio.
+
+### Architecture
+
+A new `video-recorder` Docker service runs Node.js + Playwright (headless Chromium) that:
+
+1. Receives start/stop commands from the controller via HTTP API
+2. Launches headless Chromium and navigates to the Jitsi meeting URL
+3. Joins as a hidden "Recorder" participant (audio/video muted, minimal UI)
+4. Playwright's built-in `recordVideo` captures the page content as WebM
+5. On stop, saves the video file alongside the MKA + metadata
+
+```
+[Controller] --HTTP--> [video-recorder:3000]
+                            |
+                            v
+                       [Headless Chromium]
+                            |
+                            v
+                       [Jitsi Meet Web UI]
+                            |
+                       WebRTC streams from JVB
+                            |
+                            v
+                    recordings/{meetingId}/video.webm
+```
+
+### Integration with auto-recording
+
+When `RECORD_VIDEO=true` in `.env`:
+- Auto-recording starts **both** multitrack audio (via JVB connects) and composite video (via video-recorder)
+- On conference end, both are stopped and saved to the same recording directory
+- `metadata.json` includes `"record_video": true` and `"video_recording": true`
+
+### Output
+
+Each recording directory contains:
+- `recording.mka` --- Per-participant audio (Opus tracks, one per participant)
+- `video.webm` --- Composite video (what the meeting looks like)
+- `metadata.json` --- Participant info, timestamps
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RECORD_VIDEO` | `false` | Enable composite video recording |
+| `VIDEO_RECORDER_URL` | `http://video-recorder:3000` | Video recorder service URL |
+
+### Deployment
+
+```bash
+# Start with video recording enabled
+docker compose --profile video up -d
+docker compose -f ffmpeg-recorder.yml up -d
+```
+
+### Limitations
+
+- **Composite only** --- Not per-participant video tracks (JVB does not support this)
+- **Resource usage** --- Headless Chromium uses significant memory (~300-500 MB per recording)
+- **Recorder appears as participant** --- Other users see a "Recorder" user in the meeting
+- **Video quality** --- Depends on Playwright's viewport size (default 1280x720)
 
 ---
 
@@ -176,7 +258,9 @@ JVB 2.3.259 returns `"Unsupported request (Video)"` error. The multitrack record
 | Stop recording | Same PATCH with `"connects": []` |
 | Recorder protocol | MediaJSON over WebSocket |
 | Recorder path | `/record/{meetingId}` (path param) |
-| Output format | Matroska Audio (MKA) with one Opus track per participant |
+| Output format (audio) | Matroska Audio (MKA) with one Opus track per participant |
+| Video recorder | `http://video-recorder:3000` (Playwright headless browser) |
+| Output format (video) | WebM composite video (1280x720) |
 
 ### Gotchas
 
@@ -195,6 +279,7 @@ JVB 2.3.259 returns `"Unsupported request (Video)"` error. The multitrack record
 | Component | Version | Notes |
 |-----------|---------|-------|
 | Jitsi images | stable-10590 | Tested and working |
-| JVB | 2.3.259 | Audio-only multitrack; video not supported |
-| jitsi-multitrack-recorder | latest | Official image, works as-is |
+| JVB | 2.3.259 | Audio-only multitrack; video not supported in connects API |
+| jitsi-multitrack-recorder | latest | Official image, works as-is (audio only) |
 | slixmpp | 1.8.x / 1.9.x | Bot handles both API styles |
+| Playwright | 1.40.x | Headless browser for composite video recording |

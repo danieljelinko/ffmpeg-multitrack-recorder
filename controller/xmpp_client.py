@@ -67,6 +67,12 @@ class XMPPBot(ClientXMPP):
         self.auto_recording_enabled = os.getenv("ENABLE_AUTO_RECORDING", "0") in ("1", "true", "yes")
         self.poll_interval = int(os.getenv("POLL_INTERVAL", "5"))
 
+        # Video recorder service (headless browser composite capture)
+        self.video_recorder_url = os.getenv("VIDEO_RECORDER_URL", "http://video-recorder:3000")
+
+        # Configurable recorder display name (used as MUC nickname)
+        self.recorder_display_name = os.getenv("RECORDER_DISPLAY_NAME", "Recorder")
+
         # Auto-recording state: meeting_id -> {room_name, started_at, endpoints}
         self.auto_recordings: dict[str, dict[str, Any]] = {}
         self._auto_recording_task: Optional[asyncio.Task] = None
@@ -362,7 +368,7 @@ class XMPPBot(ClientXMPP):
                             self.logger(f"   - Checking {jid} (ssrcs={bool(participant.get('ssrcs'))})")
                             
                             # Skip if this participant already has SSRCs or is focus/jibri
-                            if participant.get('ssrcs') or 'focus' in jid or 'jibri' in jid or jid == 'recorder-bot':
+                            if participant.get('ssrcs') or 'focus' in jid or 'jibri' in jid or jid == self.recorder_display_name:
                                 self.logger(f"     Skipping {jid}")
                                 continue
                             
@@ -605,7 +611,7 @@ class XMPPBot(ClientXMPP):
             room: Conference room name (e.g., "test-conference")
         """
         conference_muc = f"{room}@muc.{self.settings.domain}"
-        nick = "recorder-bot"
+        nick = self.recorder_display_name
 
         self.logger(f"🚪 Joining conference MUC: {conference_muc} as {nick}")
 
@@ -853,9 +859,9 @@ class XMPPBot(ClientXMPP):
             participant_nick = participant_jid
         
         # Skip the recorder bot itself
-        if participant_nick == "recorder-bot":
+        if participant_nick == self.recorder_display_name:
             return
-        
+
         # Parse participant metadata
         participant_data = self._parse_participant_from_presence(presence)
         
@@ -878,9 +884,9 @@ class XMPPBot(ClientXMPP):
             participant_nick = participant_jid
         
         # Skip the recorder bot itself
-        if participant_nick == "recorder-bot":
+        if participant_nick == self.recorder_display_name:
             return
-        
+
         # Track participant leaving
         self._track_participant_leave(room, participant_nick)
 
@@ -1190,6 +1196,47 @@ class XMPPBot(ClientXMPP):
             self.logger(f"[AUTO-REC] Error polling JVB debug: {e}")
             return []
 
+    async def _start_video_recording(self, room_short: str, meeting_id: str) -> bool:
+        """Start composite video recording via the headless browser video-recorder service."""
+        if not self.record_video:
+            return False
+        try:
+            self.logger(f"[VIDEO] Starting video recording for {room_short} (meeting={meeting_id})")
+            resp = requests.post(
+                f"{self.video_recorder_url}/api/record/start",
+                json={"room": room_short, "meeting_id": meeting_id},
+                timeout=30
+            )
+            if resp.status_code == 200:
+                self.logger(f"[VIDEO] Video recording started for {room_short}")
+                return True
+            self.logger(f"[VIDEO] Failed to start video: HTTP {resp.status_code} - {resp.text}")
+            return False
+        except Exception as e:
+            self.logger(f"[VIDEO] Error starting video recording: {e}")
+            return False
+
+    async def _stop_video_recording(self, room_short: str) -> dict | None:
+        """Stop composite video recording via the headless browser video-recorder service."""
+        if not self.record_video:
+            return None
+        try:
+            self.logger(f"[VIDEO] Stopping video recording for {room_short}")
+            resp = requests.post(
+                f"{self.video_recorder_url}/api/record/stop",
+                json={"room": room_short},
+                timeout=30
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                self.logger(f"[VIDEO] Video recording stopped for {room_short}: {result.get('videoPath', 'unknown')}")
+                return result
+            self.logger(f"[VIDEO] Failed to stop video: HTTP {resp.status_code} - {resp.text}")
+            return None
+        except Exception as e:
+            self.logger(f"[VIDEO] Error stopping video recording: {e}")
+            return None
+
     async def start_auto_recording_monitor(self):
         """Start the background polling loop for auto-recording."""
         if self._auto_recording_task and not self._auto_recording_task.done():
@@ -1263,11 +1310,11 @@ class XMPPBot(ClientXMPP):
             participant_snapshot = {}
             if full_room_jid in self.conference_participants:
                 for nick, pdata in self.conference_participants[full_room_jid].items():
-                    if nick in ("recorder-bot", "focus"):
+                    if nick in (self.recorder_display_name, "focus"):
                         continue
                     participant_snapshot[nick] = dict(pdata)
 
-            # Start recording
+            # Start multitrack audio recording
             success = await self.start_multitrack_recording(room_short)
             if success:
                 self.auto_recordings[meeting_id] = {
@@ -1277,8 +1324,16 @@ class XMPPBot(ClientXMPP):
                     "started_at": datetime.now(timezone.utc).isoformat(),
                     "endpoints": conf["endpoints"],
                     "participants_snapshot": participant_snapshot,
+                    "video_recording": False,
                 }
-                self.logger(f"[AUTO-REC] Recording started for {room_short} (participants: {list(participant_snapshot.keys())})")
+                self.logger(f"[AUTO-REC] Audio recording started for {room_short} (participants: {list(participant_snapshot.keys())})")
+
+                # Start composite video recording if enabled
+                if self.record_video:
+                    video_ok = await self._start_video_recording(room_short, meeting_id)
+                    self.auto_recordings[meeting_id]["video_recording"] = video_ok
+                    if video_ok:
+                        self.auto_recordings[meeting_id]["video_started_at"] = datetime.now(timezone.utc).isoformat()
             else:
                 self.logger(f"[AUTO-REC] Failed to start recording for {room_short}")
             continue
@@ -1290,7 +1345,7 @@ class XMPPBot(ClientXMPP):
             if full_jid in self.conference_participants:
                 snapshot = rec.setdefault("participants_snapshot", {})
                 for nick, pdata in self.conference_participants[full_jid].items():
-                    if nick in ("recorder-bot", "focus"):
+                    if nick in (self.recorder_display_name, "focus"):
                         continue
                     # Accumulate — don't overwrite, so we keep participants who left
                     if nick not in snapshot:
@@ -1302,11 +1357,15 @@ class XMPPBot(ClientXMPP):
             rec = self.auto_recordings.pop(meeting_id)
             self.logger(f"[AUTO-REC] Conference ended: {rec['room_short']} ({meeting_id})")
 
-            # Stop recording (may 404 if conference already gone, that's fine)
+            # Stop multitrack audio recording (may 404 if conference already gone)
             try:
                 await self.stop_multitrack_recording(rec["room_short"])
             except Exception:
                 pass
+
+            # Stop composite video recording if it was active
+            if rec.get("video_recording"):
+                await self._stop_video_recording(rec["room_short"])
 
             # Write metadata
             self._write_recording_metadata(rec)
@@ -1407,6 +1466,8 @@ class XMPPBot(ClientXMPP):
             "started_at": rec.get("started_at"),
             "ended_at": datetime.now(timezone.utc).isoformat(),
             "record_video": self.record_video,
+            "video_recording": rec.get("video_recording", False),
+            "video_started_at": rec.get("video_started_at"),
             "participants": participants,
         }
 
