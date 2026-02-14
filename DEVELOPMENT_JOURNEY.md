@@ -246,6 +246,44 @@ docker compose -f ffmpeg-recorder.yml up -d
 
 ---
 
+## Phase F: E2E Tests & ffmpeg Multi-Track Fix (Feb 2026) --- SUCCESS
+
+### E2E test suite
+
+Built an automated test suite using pytest + Playwright that simulates real participants with **synthetic audio** (Web Audio API `OscillatorNode` at unique frequencies per participant). Tests cover the full recording pipeline: auto-recording lifecycle, track count, metadata accuracy, late join, early leave, manual API, and video recording.
+
+### Bugs found and fixed
+
+#### 1. ffmpeg dropping audio tracks (`-map 0` fix)
+
+**Root cause**: The controller's `_rename_mka_tracks()` method ran `ffmpeg -c copy` without `-map 0`. By default, ffmpeg selects only **one stream per type** (audio/video/subtitle). This silently dropped all but the first audio track from multi-participant MKA files.
+
+**Fix**: Added `-map 0` to the ffmpeg command to explicitly include all input streams:
+
+```python
+# Before (broken): only 1 audio track preserved
+cmd = ["ffmpeg", "-y", "-i", str(mka_path), "-c", "copy", ...]
+
+# After (fixed): all audio tracks preserved
+cmd = ["ffmpeg", "-y", "-i", str(mka_path), "-map", "0", "-c", "copy", ...]
+```
+
+The raw MKA from the recorder always had all tracks (verified via ffprobe). The bug was purely in the post-processing remux step.
+
+#### 2. `config.startAudioMuted=false` URL hash bug
+
+Jitsi's URL config parser converts the string `"false"` to boolean `false`, which coerces to `0`. Since `participantCount >= 0` is always true, this effectively muted **all** participants. Removed `config.startAudioMuted` from URL hash params; the server-side `custom-config.js` sets it to `99999` instead.
+
+#### 3. WebRTC-level audio protection
+
+Jitsi's mute logic operates at multiple WebRTC levels: `track.enabled`, `track.stop()`, `RTCRtpSender.replaceTrack(null)`, and `RTCPeerConnection.removeTrack()`. The `inject_audio.js` script now intercepts all four to ensure synthetic audio always flows from client to JVB to recorder, regardless of Jitsi's mute decisions.
+
+### Diagnostic approach
+
+Used WebRTC `getStats()` API during live recordings to confirm both participants were actively sending audio (~870 packets each). This proved the issue was not in browsers or JVB, but in the ffmpeg post-processing step. Comparing raw vs remuxed MKA files revealed the stream count difference.
+
+---
+
 ## Key Technical Learnings
 
 ### Protocol details
@@ -273,6 +311,10 @@ docker compose -f ffmpeg-recorder.yml up -d
 4. **Conference ID timing** --- The meeting ID UUID doesn't exist until Jicofo creates the conference. The controller must poll or wait for the ID to appear in the JVB debug output.
 
 5. **JVB debug endpoint structure** --- The structure varies by JVB version. Endpoints may be a dict or list. Conference IDs may be under `meeting_id` or `id`. The controller handles both formats.
+
+6. **ffmpeg `-map 0` for multi-stream files** --- ffmpeg by default selects only one stream per type (audio/video/subtitle). When remuxing an MKA with multiple audio tracks, you must pass `-map 0` to include all streams. Without it, only the first audio track survives.
+
+7. **Jitsi URL config parser** --- Setting `config.startAudioMuted=false` in the URL hash is interpreted as boolean `false` → coerces to `0` → mutes all participants. Use server-side `custom-config.js` overrides instead of URL params for mute thresholds.
 
 ### Version constraints
 

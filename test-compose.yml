@@ -1,0 +1,27 @@
+services:
+  test-runner:
+    build:
+      context: .
+      dockerfile: tests/Dockerfile
+    volumes:
+      - ./recordings:/recordings:Z
+      - ./tests:/tests:ro
+    environment:
+      - JITSI_URL=https://web:443
+      - CONTROLLER_URL=http://controller:8080
+      - VIDEO_RECORDER_URL=http://video-recorder:3000
+      - RECORDER_API_SECRET=${RECORDER_API_SECRET}
+      - RECORDINGS_DIR=/recordings
+    depends_on:
+      - web
+      - controller
+      - recorder
+    networks:
+      meet.jitsi:
+    profiles:
+      - test
+
+networks:
+  meet.jitsi:
+    external:
+      name: ffmpeg-multitrack-recorder_meet.jitsi

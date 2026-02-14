@@ -1419,8 +1419,9 @@ class XMPPBot(ClientXMPP):
                 return
 
             # Remux with new metadata (copy all codecs)
+            # -map 0 is REQUIRED to include ALL streams; ffmpeg defaults to 1 stream per type
             tmp_path = mka_path.with_suffix(".tmp.mka")
-            cmd = ["ffmpeg", "-y", "-i", str(mka_path), "-c", "copy"] + metadata_args + [str(tmp_path)]
+            cmd = ["ffmpeg", "-y", "-i", str(mka_path), "-map", "0", "-c", "copy"] + metadata_args + [str(tmp_path)]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             if result.returncode != 0:
                 self.logger(f"[AUTO-REC] ffmpeg remux failed: {result.stderr[:300]}")
