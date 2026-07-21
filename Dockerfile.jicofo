@@ -1,4 +1,4 @@
-FROM jitsi/jicofo:unstable
+FROM jitsi/jicofo:stable-11031
 
 # Fix trusted-domains bug that causes XmppStringprepException
 # This bug causes "empty string" errors in XMPP authentication
