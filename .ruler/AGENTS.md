@@ -1,1 +1,0 @@
-# The collection of rules that are applied to the codebase.
