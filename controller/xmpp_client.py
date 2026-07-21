@@ -16,6 +16,7 @@ from aiortc.contrib.media import MediaBlackhole
 
 from xmpp_config import XMPPSettings, load_xmpp_settings
 from jingle_sdp import jingle_to_sdp, sdp_to_jingle_accept, extract_ssrcs_from_jingle
+from fs_ownership import chown_tree_to_host
 
 
 class XMPPBot(ClientXMPP):
@@ -64,6 +65,9 @@ class XMPPBot(ClientXMPP):
         self.record_video = os.getenv("RECORD_VIDEO", "false").lower() in ("1", "true", "yes")
         self.min_participants = int(os.getenv("MIN_PARTICIPANTS", "2"))
         self.recordings_dir = os.getenv("RECORDINGS_DIR", "/recordings")
+        _uid, _gid = os.getenv("HOST_UID"), os.getenv("HOST_GID")
+        self.host_uid = int(_uid) if _uid else None  # chown finished recordings back to host user
+        self.host_gid = int(_gid) if _gid else None
         self.auto_recording_enabled = os.getenv("ENABLE_AUTO_RECORDING", "0") in ("1", "true", "yes")
         self.poll_interval = int(os.getenv("POLL_INTERVAL", "5"))
 
@@ -1504,6 +1508,7 @@ class XMPPBot(ClientXMPP):
         self._rename_mka_tracks(rec_dir, snapshot)
 
         # Rename directory to {yymmdd_hhmmss}_{room}_{meetingId}
+        final_dir = rec_dir
         try:
             started = rec.get("started_at", "")
             if started:
@@ -1514,9 +1519,22 @@ class XMPPBot(ClientXMPP):
             new_dir = rec_dir.parent / new_name
             if not new_dir.exists():
                 rec_dir.rename(new_dir)
+                final_dir = new_dir
                 self.logger(f"[AUTO-REC] Renamed recording dir to {new_name}")
         except Exception as e:
             self.logger(f"[AUTO-REC] Failed to rename recording dir: {e}")
+
+        # Hand the finished dir to the host user (recorder/controller write it as root)
+        self._chown_recording_dir(final_dir)
+
+    def _chown_recording_dir(self, rec_dir: Path):
+        "Recursively chown a finished recording dir to HOST_UID:HOST_GID. No-op unless running as root with both set."
+        is_root = getattr(os, "geteuid", lambda: -1)() == 0
+        try:
+            n = chown_tree_to_host(rec_dir, self.host_uid, self.host_gid, is_root)
+            if n: self.logger(f"[AUTO-REC] chowned {n} paths in {rec_dir} to {self.host_uid}:{self.host_gid}")
+        except OSError as e:
+            self.logger(f"[AUTO-REC] chown of {rec_dir} failed: {e}")
 
 
 def create_xmpp_bot_from_env(logger: Optional[Callable[[str], None]] = None) -> XMPPBot:

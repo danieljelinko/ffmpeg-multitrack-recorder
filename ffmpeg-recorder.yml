@@ -39,6 +39,9 @@ services:
       - VIDEO_RECORDER_URL
       # Recorder appearance
       - RECORDER_DISPLAY_NAME
+      # Host ownership for finished recordings (controller chowns the final dir)
+      - HOST_UID
+      - HOST_GID
     volumes:
       - ./controller:/app
       - ${RECORDINGS_PATH:-./recordings}:/recordings:Z
