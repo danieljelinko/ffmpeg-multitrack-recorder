@@ -17,6 +17,7 @@ from aiortc.contrib.media import MediaBlackhole
 from xmpp_config import XMPPSettings, load_xmpp_settings
 from jingle_sdp import jingle_to_sdp, sdp_to_jingle_accept, extract_ssrcs_from_jingle
 from fs_ownership import chown_tree_to_host
+from recording_dirs import consolidate_recording_dir
 
 
 class XMPPBot(ClientXMPP):
@@ -984,9 +985,13 @@ class XMPPBot(ClientXMPP):
             self.logger(f"❌ Error resolving via debug: {e}")
             return None
 
-    async def start_multitrack_recording(self, room_name: str, record_video: bool | None = None) -> bool:
+    async def start_multitrack_recording(self, room_name: str, record_video: bool | None = None) -> str | None:
         """
         Start multitrack recording via JVB REST API.
+
+        Returns the conference id the recorder used for its output dir (the path
+        param baked into the recorder WebSocket URL) on success, None on failure.
+        Callers key the recording dir on this so audio/video land together.
         """
         # Normalize room name (remove domain if present)
         if "@" in room_name:
@@ -1019,8 +1024,8 @@ class XMPPBot(ClientXMPP):
             
         if not conference_id:
             self.logger(f"❌ Could not find conference ID for room {room_short}")
-            return False
-            
+            return None
+
         self.logger(f"✅ Using conference ID: {conference_id}")
         
         # Construct recorder WebSocket URL with path parameter
@@ -1057,7 +1062,7 @@ class XMPPBot(ClientXMPP):
             
             if response.status_code == 200:
                 self.logger(f"✅ Successfully started multitrack recording")
-                return True
+                return conference_id
             elif response.status_code == 404:
                 self.logger(f"❌ JVB returned 404. ID might be wrong. Retrying via debug resolution...")
                 # Force debug resolution
@@ -1073,17 +1078,19 @@ class XMPPBot(ClientXMPP):
                     )
                     if response.status_code == 200:
                         self.logger(f"✅ Successfully started multitrack recording (on retry)")
-                        return True
-            
+                        # recorder dir is still conference_id: the retry only changes the
+                        # PATCH target, not the recorder WS URL's path param (recorder_url)
+                        return conference_id
+
             self.logger(f"❌ Failed to start recording: HTTP {response.status_code}")
             self.logger(f"Response: {response.text}")
-            return False
-                
+            return None
+
         except Exception as e:
             self.logger(f"❌ Error calling JVB REST API: {e}")
             import traceback
             self.logger(f"Traceback: {traceback.format_exc()}")
-            return False
+            return None
 
     async def stop_multitrack_recording(self, room_name: str) -> bool:
         """
@@ -1318,13 +1325,16 @@ class XMPPBot(ClientXMPP):
                         continue
                     participant_snapshot[nick] = dict(pdata)
 
-            # Start multitrack audio recording
-            success = await self.start_multitrack_recording(room_short)
-            if success:
+            # Start multitrack audio recording. Returns the id the recorder used
+            # for its output dir (may differ from the /debug meeting_id) — key the
+            # recording dir on it so audio + video + metadata land together.
+            recorder_dir_id = await self.start_multitrack_recording(room_short)
+            if recorder_dir_id:
                 self.auto_recordings[meeting_id] = {
                     "room_name": room_name,
                     "room_short": room_short,
                     "meeting_id": meeting_id,
+                    "recorder_dir_id": recorder_dir_id,
                     "started_at": datetime.now(timezone.utc).isoformat(),
                     "endpoints": conf["endpoints"],
                     "participants_snapshot": participant_snapshot,
@@ -1332,9 +1342,9 @@ class XMPPBot(ClientXMPP):
                 }
                 self.logger(f"[AUTO-REC] Audio recording started for {room_short} (participants: {list(participant_snapshot.keys())})")
 
-                # Start composite video recording if enabled
+                # Start composite video recording if enabled — into the recorder's dir
                 if self.record_video:
-                    video_ok = await self._start_video_recording(room_short, meeting_id)
+                    video_ok = await self._start_video_recording(room_short, recorder_dir_id)
                     self.auto_recordings[meeting_id]["video_recording"] = video_ok
                     if video_ok:
                         self.auto_recordings[meeting_id]["video_started_at"] = datetime.now(timezone.utc).isoformat()
@@ -1448,6 +1458,7 @@ class XMPPBot(ClientXMPP):
         """
         meeting_id = rec["meeting_id"]
         room_short = rec["room_short"]
+        recorder_dir_id = rec.get("recorder_dir_id") or meeting_id  # dir identity (see recording_dirs)
 
         # Use accumulated snapshot (nick = endpoint_id -> participant data)
         snapshot = rec.get("participants_snapshot", {})
@@ -1476,25 +1487,9 @@ class XMPPBot(ClientXMPP):
             "participants": participants,
         }
 
-        # Find the recording directory — recorder writes to /data/{meetingId}/
-        # The meeting_id from debug may differ from the one the recorder uses,
-        # so search for any directory containing an MKA created during this session.
-        rec_dir = Path(self.recordings_dir) / meeting_id
-        if not rec_dir.exists():
-            parent = Path(self.recordings_dir)
-            if parent.exists():
-                # Search by meeting_id substring match first
-                matches = [d for d in parent.iterdir() if d.is_dir() and meeting_id in d.name]
-                if not matches:
-                    # Fallback: find most recently created dir with an MKA file
-                    matches = sorted(
-                        [d for d in parent.iterdir() if d.is_dir() and list(d.glob("*.mka"))],
-                        key=lambda d: d.stat().st_mtime, reverse=True
-                    )
-                if matches:
-                    rec_dir = matches[0]
-                else:
-                    rec_dir.mkdir(parents=True, exist_ok=True)
+        # Consolidate the split audio/video dirs into one (the recorder diverts the
+        # MKA to {id}-1 when the video recorder already created {id} — see recording_dirs).
+        rec_dir = consolidate_recording_dir(Path(self.recordings_dir), recorder_dir_id)
 
         # Write metadata
         meta_path = rec_dir / "metadata.json"
@@ -1515,7 +1510,7 @@ class XMPPBot(ClientXMPP):
                 ts = datetime.fromisoformat(started).strftime("%y%m%d_%H%M%S")
             else:
                 ts = datetime.now(timezone.utc).strftime("%y%m%d_%H%M%S")
-            new_name = f"{ts}_{room_short}_{meeting_id}"
+            new_name = f"{ts}_{room_short}_{recorder_dir_id}"
             new_dir = rec_dir.parent / new_name
             if not new_dir.exists():
                 rec_dir.rename(new_dir)
