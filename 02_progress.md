@@ -5,7 +5,13 @@
 
 ## Next
 - Phase 2: Zulip → our Jitsi call-manager, record a Zulip-started call (run on `stable-11031`).
-- Phase 3: ai4hu-vps deploy feasibility + design (gated).
+- Phase 3: ai4hu-vps deploy feasibility + design (gated). **Routing ruled 2026-09-09 (O204/O205, outside this repo — see
+  `~/Work/common-ground/00-ground-living-docs/260909__s32_captiva_ops_inventory.md` §4b-bis and `03_decisions.md`):** the deploy
+  recipe lives in `ai4hu-vps/10_setup/jitsi/` as a normal service (gate + compose + SERVICES.md/REBOOT_IMPACT.md rows +
+  monitoring), with **both** the VPS and the LAN GPU box `captiva` as targets; this repo stays the source of the images, config
+  and validation (`stable-11031`, 34/34). captiva currently runs an old `stable-9584` stack from the archived repo — the unit
+  tears it down first. **The Phase 3 question narrows to a measurement:** does the VPS's hardware carry a call at all? If not,
+  captiva is the target and the VPS entry drops out.
 
 ## Blocked
 - (none)
